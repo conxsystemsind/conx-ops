@@ -290,7 +290,7 @@
     .report-toolbar{display:none !important;}
     .report-scroll{padding:0 !important; overflow:visible !important; background:#fff !important;}
     .sheet-wrap{width:210mm !important; height:auto !important; margin:0 !important;}
-    .report-doc{transform:none !important; box-shadow:none !important; border-radius:0 !important; width:210mm !important; min-height:297mm !important; padding:10mm !important;}
+    .report-doc{transform:none !important; box-shadow:none !important; border-radius:0 !important; width:210mm !important; min-height:1122px !important; padding:40px !important;}
     .toast{display:none !important;}
   }
   @media (prefers-reduced-motion: reduce){ *{animation:none !important; transition:none !important;} }
@@ -419,11 +419,24 @@ function softRender(){
   render();
 }
 
+// A copy of the data is kept on this device. Updating the app (index.html) never touches it or the database,
+// so counts and records are identical before and after an update, and still show when offline.
+const APP_VERSION = 'V1';
+const CACHE_KEY = 'conx-ops-data';
+let _cacheT = null;
+function saveCache(){
+  clearTimeout(_cacheT);
+  _cacheT = setTimeout(() => { try{ const o = {v: APP_VERSION, at: Date.now()}; KINDS.forEach(k => o[k] = state[k]); localStorage.setItem(CACHE_KEY, JSON.stringify(o)); }catch(e){} }, 300);
+}
+function readCache(){ try{ const o = JSON.parse(localStorage.getItem(CACHE_KEY) || 'null'); return (o && KINDS.every(k => Array.isArray(o[k]))) ? o : null; }catch(e){ return null; } }
+function clearCache(){ try{ localStorage.removeItem(CACHE_KEY); }catch(e){} }
+
 function applyChange(kind, id, row){
   if(!KINDS.includes(kind)) return;
   state[kind] = row
     ? (state[kind].some(x => x.id === id) ? state[kind].map(x => x.id === id ? row : x) : [...state[kind], row])
     : state[kind].filter(x => x.id !== id);
+  saveCache();
 }
 
 async function loadAllRows(){
@@ -434,8 +447,12 @@ async function loadAllRows(){
     rows.push(...data);
     if(data.length < 1000) break;
   }
+  // Safety: never replace saved data with an empty answer (e.g. a wrong project or a database hiccup)
+  const cached = readCache();
+  if(!rows.length && cached && KINDS.some(k => cached[k].length)) throw new Error('The database returned no records');
   KINDS.forEach(k => state[k] = []);
   rows.forEach(r => { if(KINDS.includes(r.kind)) state[r.kind].push({...r.data, id: r.id}); });
+  saveCache();
 }
 
 let channel = null;
@@ -476,6 +493,7 @@ async function doLogin(e){
 async function signOut(){
   await SB.auth.signOut();
   if(channel){ SB.removeChannel(channel); channel = null; }
+  clearCache();
   KINDS.forEach(k => state[k] = []);
   state.loaded = false; state.needLogin = true; state.modal = null; state.dataOpen = false; state.reportView = null;
   render();
@@ -483,9 +501,11 @@ async function signOut(){
 
 async function enter(){
   state.needLogin = false; state.loaded = false; state.syncError = null;
+  const saved = readCache();   // show the copy on this device straight away
+  if(saved){ KINDS.forEach(k => state[k] = saved[k]); state.loaded = true; }
   render();
   try{ await loadAllRows(); }
-  catch(e){ state.syncError = 'load failed'; KINDS.forEach(k => state[k] = state[k] || []); }
+  catch(e){ state.syncError = saved ? 'showing the copy saved on this device' : 'load failed'; KINDS.forEach(k => state[k] = state[k] || []); }
   state.loaded = true;
   state.mode = 'sync';
   loadBackupEmail().then(() => softRender());
@@ -566,16 +586,20 @@ async function sendBackupNow(){
 }
 
 async function upsert(kind, obj){
-  state[kind] = state[kind].some(x => x.id === obj.id)
-    ? state[kind].map(x => x.id === obj.id ? obj : x)
-    : [...state[kind], obj];
+  const before = state[kind];
+  state[kind] = before.some(x => x.id === obj.id)
+    ? before.map(x => x.id === obj.id ? obj : x)
+    : [...before, obj];
   const {error} = await SB.from('records').upsert({kind, id: obj.id, data: obj, updated_at: new Date().toISOString()}, {onConflict: 'kind,id'});
-  if(error) throw error;
+  if(error){ state[kind] = before; throw error; }   // a failed save must not look saved
+  saveCache();
 }
 async function removeRecord(kind, id){
-  state[kind] = state[kind].filter(x => x.id !== id);
+  const before = state[kind];
+  state[kind] = before.filter(x => x.id !== id);
   const {error} = await SB.from('records').delete().eq('kind', kind).eq('id', id);
-  if(error) throw error;
+  if(error){ state[kind] = before; throw error; }
+  saveCache();
 }
 function writeError(err){
   const code = err && err.code;
@@ -959,7 +983,8 @@ function render(){
         </nav>
         <div class="spacer"></div>
         <div class="sidefoot">
-          <div class="sync ${chip[0]}" style="padding:4px 12px 8px"><i></i>${chip[1]}</div>
+          <div class="sync ${chip[0]}" style="padding:4px 12px 2px"><i></i>${chip[1]}</div>
+          <div style="padding:0 12px 8px; font-size:11px; color:var(--muted,#8b8fa8)">Conx Ops ${APP_VERSION}</div>
           <button onclick="openData()">${ic('db')}Data &amp; backup</button>
           <button onclick="signOut()">${ic('logout')}Sign out</button>
         </div>
@@ -989,7 +1014,7 @@ function render(){
     ${state.dataOpen ? renderDataModal() : ''}
     ${state.reportView ? renderReportPreview() : ''}
   `;
-  if(state.reportView) fitSheet();
+  if(state.reportView){ fitSheet(); setTimeout(() => { if(state.reportView) fitSheet(); }, 250); }
   runVisuals();
   if(state.modal){ const ci = document.querySelector('.modal form [name="client"]'); if(ci) onClientInput(ci); }
 }
@@ -1440,6 +1465,7 @@ function reportTableHTML(r){
     <tr><td colspan="4" style="${B} ${P}"><b>PMS DESCRIPTION:</b> ${esc(r.pmsDescription)}</td></tr>
     <tr><td colspan="4" style="${B} ${P} font-weight:700;">WORK CARRIED OUT:</td></tr>
     ${workRows}
+    <tr class="fill"><td colspan="4" style="border-left:1.5px solid #000; border-right:1.5px solid #000; padding:0; height:0;"></td></tr>
     <tr><td colspan="4" style="${B} ${P}"><b>SPARES REPLACED IF ANY:</b> ${esc(r.sparesReplaced)||'None'}</td></tr>
     <tr><td colspan="4" style="${B} ${P}"><b>WORK &mdash; COMPLETED / PENDING, IF PENDING REASONS:</b> ${esc(r.workStatus)||'&mdash;'}${r.workStatus==='Pending' && r.pendingReason ? ' &mdash; '+esc(r.pendingReason) : ''}</td></tr>
     <tr>
@@ -1581,7 +1607,16 @@ function renderReportPreview(){
   `;
 }
 
+// Stretch the report so it fills one A4 page: the empty space is added to the "work carried out" box.
+const A4_INNER_H = 1123 - 80 - 4;   // page height minus 40px padding top and bottom, minus a small safety margin
+function fillPage(root){
+  const t = root && root.querySelector('table'); const f = root && root.querySelector('tr.fill td');
+  if(!t || !f) return;
+  f.style.height = '0px';
+  f.style.height = Math.max(0, A4_INNER_H - t.offsetHeight) + 'px';
+}
 function fitSheet(){
+  fillPage(document.getElementById('reportDocEl'));
   const wrap = document.getElementById('sheetWrap');
   const doc = document.getElementById('reportDocEl');
   const scroller = wrap && wrap.parentElement;
@@ -1627,6 +1662,8 @@ async function downloadReportPDF(){
     host.style.cssText = 'position:absolute; left:-10000px; top:0; width:794px; min-height:1123px; box-sizing:border-box; padding:40px; background:#fff;';
     host.innerHTML = reportTableHTML(r);
     document.body.appendChild(host);
+    await new Promise(r => setTimeout(r, 120));
+    fillPage(host);
     const canvas = await window.html2canvas(host, {scale: 3, backgroundColor: '#ffffff', useCORS: true, logging: false});
     const pdf = new window.jspdf.jsPDF({unit: 'mm', format: 'a4', compress: true});
     const pageW = 210, pageH = 297;
