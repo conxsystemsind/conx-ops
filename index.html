@@ -1691,22 +1691,93 @@ function autofillPmsDesc(system){
   }
 }
 
-function localTidy(text){
-  const FAULT = /\b(not working|not responding|faulty|fail(ed|ure|ing)?|damaged|broken|defective|error|offline|no signal|no display|no power|dead|loose|burnt|burned|needs? (replacement|repair|attention)|issue found|problem found|noisy|overheat\w*)\b/i;
-  const OK = /\b(no (issue|problem|fault|error)s?|without (any )?(issue|problem)s?|all (are )?(ok|fine|good|working))\b/i;
-  const VERB = /^(checked|cleaned|tested|verified|updated|replaced|configured|inspected|observed|tightened|aligned|adjusted|reset|rebooted|restarted|checked and)\b/i;
-  const parts = String(text).replace(/\r/g,'').split(/\n+|;\s*|\.\s+(?=[A-Za-z0-9])/).map(x => x.trim()).filter(Boolean);
+const PM_CHECKLIST = {
+  'CCTV': ['Checked all cameras live view, found working normal','Cleaned the camera domes and lenses','Checked recording and playback on the NVR','Checked HDD status and recording backup days','Checked network connectivity and power supply of all devices'],
+  'Access Control': ['Checked all door controllers and readers, found working normal','Checked card and biometric access on all doors','Checked the electromagnetic locks, door sensors and exit switches','Checked power supply and battery backup of the controllers','Checked the access software and event logs'],
+  'Fire Alarm System': ['Checked the fire alarm panel, found no fault displayed','Tested the smoke and heat detectors, found working normal','Tested the manual call points, hooters and sounders','Checked the panel battery and power supply','Checked loop wiring and zone status'],
+  'Fire Extinguisher': ['Checked the gauge pressure of all extinguishers, found all in range','Checked the refill due dates and seals','Checked mounting, hoses and nozzles','All the extinguishers are in good condition'],
+  'FM200': ['Checked the cylinder pressure gauges, found in range','Checked the FM200 control panel, found normal','Checked the detectors, abort and manual release switches','Checked the sounders, strobes and solenoid connections','Checked the room integrity and signage'],
+  'Public Addressing System': ['Checked the PA amplifier and mixer, found working normal','Checked all speakers for sound clarity','Checked the microphone and paging console','Checked cabling, volume controllers and power supply'],
+  'Biometrics': ['Checked all biometric devices, found working normal','Cleaned the sensor surface and checked fingerprint and face recognition','Checked the device network connection and time sync','Checked data sync with the attendance or access software'],
+  'BMS': ['Checked the BMS controllers and network, found working normal','Checked sensor readings and field device status','Checked graphics and alarms on the BMS workstation','Checked power supply and communication of all controllers'],
+  'Boom Barrier': ['Checked the boom barrier opening and closing operation','Checked the loop detector and safety sensors','Checked the motor, gearbox and arm alignment','Lubricated the moving parts and checked the controller and remote'],
+  'Pneumatic Automation': ['Checked the compressor, air pressure and pipelines for leaks','Checked the pneumatic cylinders and valves operation','Checked the controller and sensors','Cleaned the filters and drained moisture']
+};
+const PM_TOPICS = [[/camera|cam\b|dome|lens/i,'cameras'],[/nvr|dvr|recording|playback/i,'recording'],[/hdd|hard ?disk|storage/i,'HDD'],[/network|switch|router|poe|lan\b/i,'network'],[/ups|battery|power|smps|psu/i,'power supply'],[/panel/i,'panel'],[/detector|smoke|heat/i,'detectors'],[/sounder|hooter|strobe|speaker|amplifier/i,'sounders and speakers'],[/mcp|call point/i,'call points'],[/cylinder|gauge|pressure/i,'pressure gauges'],[/reader|card|biometric|finger|face/i,'readers'],[/controller/i,'controllers'],[/lock|door|exit/i,'door locks'],[/boom|barrier|loop|motor/i,'boom and sensors'],[/valve|compressor|pneumatic/i,'pneumatic parts'],[/sensor/i,'sensors'],[/software|server|log/i,'software']];
+
+// Offline writer: turns rough notes into proper service-report lines (no server or key needed)
+function localRewrite(text, system){
+  const FAULT = /\b(not working|not responding|faulty|fail(ed|ure|ing)?|damaged|broken|defective|error|offline|no signal|no display|no power|dead|loose|burnt|burned|needs? (replacement|repair|attention)|issue|problem|noisy|overheat\w*|down|missing|stolen|blur\w*|hang\w*|stuck)\b/i;
+  const OK = /\b(no (issue|problem|fault|error)s?|without (any )?(issue|problem)s?|all (are )?(ok|okay|fine|good|working)|working (normal|fine|ok)|found (normal|ok|good))\b/i;
+  const VERBS = {checked:'checked',check:'checked',cleaned:'cleaned',clean:'cleaned',tested:'tested',test:'tested',verified:'verified',updated:'updated',update:'updated',replaced:'replaced',replace:'replaced',configured:'configured',inspected:'inspected',observed:'observed',tightened:'tightened',aligned:'aligned',adjusted:'adjusted',reset:'reset',rebooted:'rebooted',restarted:'restarted',lubricated:'lubricated',greased:'greased',calibrated:'calibrated',serviced:'serviced',measured:'measured',changed:'changed',fixed:'fixed',repaired:'repaired',rectified:'rectified',backed:'backed',synced:'synced',tuned:'tuned'};
+  const NOUN = /^(cameras?|nvr|dvr|hdd|panel|detectors?|sounders?|hooters?|speakers?|amplifier|mixer|readers?|controllers?|locks?|sensors?|battery|batteries|ups|network|switch|router|cables?|cabling|wiring|power supply|extinguishers?|cylinders?|gauges?|valves?|compressor|filters?|software|server|recorder|monitor|domes?|lenses|lens|barrier|loop|motor|device|devices|system|connections?|doors?)\b/i;
+  const ABBR = [[/\bcams\b/gi,'cameras'],[/\bcam\b/gi,'camera'],[/\bnvr\b/gi,'NVR'],[/\bdvr\b/gi,'DVR'],[/\bhdd\b/gi,'HDD'],[/\bups\b/gi,'UPS'],[/\bsmps\b/gi,'SMPS'],[/\bpsu\b/gi,'PSU'],[/\bmcp\b/gi,'MCP'],[/\bn\/?w\b/gi,'network'],[/\bpoe\b/gi,'PoE'],[/\bip\b/gi,'IP'],[/\bbio\b/gi,'biometric'],[/\bpls\b/gi,'please'],[/\bw\/o\b/gi,'without'],[/\bdoin\b/gi,'doing']];
+  const cap = t => t.charAt(0).toUpperCase() + t.slice(1);
+  const parts = String(text).replace(/\r/g,'').split(/\n+|;\s*|\.\s+(?=[A-Za-z0-9])|,\s+(?!and\b|but\b|found\b|which\b|to be\b|so\b)|\s+&\s+/).map(x => x.trim()).filter(Boolean);
   const out = [], seen = new Set();
-  parts.forEach(p => {
-    let flagged = p.startsWith('!'); p = p.replace(/^[!\-*•\s]+/, '').replace(/^\d+[.)]\s+/, '').replace(/\s+/g,' ').replace(/[.,]+$/,'').trim();
+  const push = line => { const k = line.toLowerCase(); if(!seen.has(k)){ seen.add(k); out.push(line); } };
+  parts.forEach(raw => {
+    let flagged = raw.startsWith('!');
+    let p = raw.replace(/^[!\-*•\s]+/, '').replace(/^\d+[.)]\s+/, '').replace(/\s+/g,' ').replace(/[.,]+$/,'').trim();
     if(!p) return;
-    if(VERB.test(p)) p = 'We have ' + p.charAt(0).toLowerCase() + p.slice(1);
-    p = p.charAt(0).toUpperCase() + p.slice(1);
-    if(!flagged && FAULT.test(p) && !OK.test(p)) flagged = true;
-    const line = (flagged ? '! ' : '') + p;
-    if(!seen.has(line.toLowerCase())){ seen.add(line.toLowerCase()); out.push(line); }
+    ABBR.forEach(([re, v]) => { p = p.replace(re, v); });
+    p = p.replace(/\bcameras\b/g, 'cameras');
+    const words = p.split(' ');
+    const v0 = VERBS[words[0].toLowerCase()];
+    const faulty = FAULT.test(p) && !OK.test(p);
+    let line;
+    if(v0){
+      let rest = words.slice(1).join(' ');
+      if(rest && NOUN.test(rest) && !/^(the|all|a|an|each|every|\d)/i.test(rest)) rest = 'the ' + rest;
+      line = 'We have ' + v0 + (rest ? ' ' + rest : '');
+      if(!faulty && /\s(?:all\s)?(ok|okay|fine)$/i.test(line)) line = line.replace(/,?\s(?:all\s)?(ok|okay|fine)$/i, ', found working normal');
+      else if(!faulty && !/(found|working|normal|good|condition|ok|fine|range|clean)/i.test(rest) && ['checked','tested','verified','inspected','observed'].includes(v0)) line += ', found working normal';
+    } else {
+      line = p;
+      let m;
+      if(!faulty && (m = line.match(/^(.*?)\s+(?:is |are |was |were )?(ok|okay|fine|working|normal|working fine|working ok)$/i)) && m[1]){
+        line = cap(m[1]) + (/^all\b|s$/i.test(m[1]) ? ' are' : ' is') + ' working normal';
+      } else if((m = line.match(/^(.*?)\s+(?:is |are )?good$/i)) && m[1]){
+        line = cap(m[1]) + (/^all\b|s$/i.test(m[1]) ? ' are' : ' is') + ' in good condition';
+      } else if(faulty && !/found/i.test(line)){
+        line = line.replace(/\b(not working|not responding|faulty|damaged|broken|defective|offline|dead|loose|burnt|burned|missing|stuck)\b/i, 'found $1');
+        if(!/found/i.test(line)) line = line + ' found';
+      }
+    }
+    if(faulty && !/to be|please|needs?/i.test(line)) line += ', to be rectified';
+    line = cap(line);
+    push((flagged || faulty ? '! ' : '') + line);
   });
-  return out.join('\n');
+  // very short notes: fill in the standard PM points for this system
+  const total = String(text).trim().split(/\s+/).length;
+  let added = 0;
+  if(total <= 14 || out.length <= 2){
+    const have = out.join(' ').toLowerCase();
+    (PM_CHECKLIST[system] || []).forEach(item => {
+      const keys = item.toLowerCase().split(/\W+/).filter(w => w.length > 4 && !/(checked|found|working|normal|condition|status)/.test(w));
+      const shared = keys.filter(k => have.includes(k.slice(0, 6))).length;
+      if(shared < 2){ push(item.replace(/^(Checked|Tested|Cleaned|Lubricated)\b/, m => 'We have ' + m.toLowerCase())); added++; }
+    });
+  }
+  return {text: out.join('\n'), added};
+}
+function localTidy(text){ return localRewrite(text, '').text; }
+
+// A short PMS description built from the system and what the notes mention
+function pmsFrom(system, text, nature){
+  const lines = String(text).split('\n').map(l => l.trim()).filter(Boolean);
+  if(nature === 'Complaint'){
+    const first = (lines.find(l => l.startsWith('!')) || lines[0] || '').replace(/^!\s*/, '').slice(0, 90);
+    return 'Complaint attended' + (system ? ' (' + system + ')' : '') + (first ? ': ' + first : '');
+  }
+  const body = lines.join(' ');
+  const topics = []; PM_TOPICS.forEach(([re, name]) => { if(re.test(body) && !topics.includes(name)) topics.push(name); });
+  return 'Preventive Maintenance of ' + (system || 'system') + (topics.length ? ' – ' + topics.slice(0, 4).join(', ') + ' checked' : '');
+}
+function setPmsDescription(desc){
+  const el = document.getElementById('pmsDescInput'); if(!el || !desc) return;
+  const v = el.value.trim();
+  if(!v || v === (el.dataset.auto || '') || /^(Preventive Maintenance of|Complaint attended)/i.test(v)){ el.value = desc; el.dataset.auto = desc; }
 }
 
 async function geminiRewrite(prompt){
@@ -1742,31 +1813,45 @@ async function rewriteWorkPerformed(){
   const label = btn.innerHTML;
   btn.disabled = true; btn.textContent = 'Rewriting…';
   if(note) note.textContent = '';
+  const natureEl = document.querySelector('.modal [name=natureOfCall]');
+  const nature = natureEl ? natureEl.value : 'PMS';
   const prompt = [
-    'You are helping a field engineer at a CCTV / fire alarm / access control system integration company write the "Work Carried Out" section of a preventive maintenance service report for a ' + (system || 'system') + '.',
+    'You are helping a field engineer at a CCTV / fire alarm / access control system integration company write the "Work Carried Out" section of a ' + (nature === 'Complaint' ? 'complaint service' : 'preventive maintenance service') + ' report for a ' + (system || 'system') + '.',
     '', 'Rough notes from the engineer:', rough, '',
-    'Rewrite these into short, plain, field-report style lines, one point per line, matching this tone and register:',
+    'Rewrite these into clear field-report lines, one point per line, matching this tone and register:',
     '"We have checked the gauge pressure of extinguisher, found all are in range"',
     '"32 channel NVR working normal"',
     '"All the accessories are in good condition"', '',
     'Rules:',
+    '- Actually rewrite and expand the notes into complete sentences, fixing grammar and spelling. If the notes are very brief, add the usual points a technician checks during a visit for this system, but never invent counts, model numbers or faults.',
     '- One factual point per line, no bullet symbols, no numbering.',
     '- Plain, slightly informal technician English, not corporate-polished.',
-    '- Do not invent equipment counts, model numbers, or details the notes do not imply.',
     '- If a line describes a fault, a defect, or something not working, start that line with "!" so it can be flagged.',
-    '- Output only the lines. No heading, no preamble.'
+    '- The very first line must be exactly "PMS: " followed by a short description of the visit (max 12 words), e.g. "PMS: Preventive Maintenance of CCTV, cameras and NVR checked".',
+    '- Then output only the report lines. No other heading or preamble.'
   ].join('\n');
-  const clean = t => t.split('\n').map(l => l.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '').trim()).filter(Boolean).join('\n');
+  const clean = t => t.split('\n').map(l => l.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '').trim()).filter(Boolean);
+  const apply = (lines, pms, how) => {
+    workEl.value = lines.join('\n');
+    setPmsDescription(pms || pmsFrom(system, workEl.value, nature));
+    if(note) note.textContent = how;
+  };
+  const useLocal = (why) => {
+    const r = localRewrite(rough, system);
+    apply(r.text.split('\n'), null, why + (r.added ? ' Added ' + r.added + ' standard checklist point' + (r.added === 1 ? '' : 's') + ' because the notes were short. Delete any you did not do.' : ''));
+  };
   try{
-    if(SAMPLE){ const r = await SAMPLE(prompt); workEl.value = clean(r.text); }
-    else if(state.geminiKey){ workEl.value = clean(await geminiRewrite(prompt)); }
-    else {
-      workEl.value = localTidy(rough);
-      if(note) note.textContent = 'Quick tidy applied. For a smarter AI rewrite, add a free Gemini key under Data.';
+    if(SAMPLE || state.geminiKey){
+      const raw = SAMPLE ? (await SAMPLE(prompt)).text : await geminiRewrite(prompt);
+      let lines = clean(raw), pms = '';
+      if(lines.length && /^pms\s*:/i.test(lines[0])){ pms = lines.shift().replace(/^pms\s*:\s*/i, '').trim(); }
+      if(!lines.length) throw new Error('empty');
+      apply(lines, pms, 'Rewritten with AI. Read it once and edit anything that is not right.');
+    } else {
+      useLocal('Rewritten with the built-in writer. Add a free Gemini key under Data for smarter AI.');
     }
   }catch(e){
-    workEl.value = localTidy(rough);
-    if(note) note.textContent = (e && e.code === 'rate_limited') ? 'AI limit reached for now, so a quick tidy was applied instead.' : 'Could not reach the AI, so a quick tidy was applied instead.';
+    useLocal((e && e.code === 'rate_limited') ? 'AI limit reached for now, so the built-in writer was used.' : 'Could not reach the AI, so the built-in writer was used.');
   }finally{
     btn.disabled = false; btn.innerHTML = label;
   }
