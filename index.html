@@ -343,6 +343,15 @@
   .issue svg{width:15px; height:15px; margin-top:1px;}
   .report-toolbar button.act.primary{white-space:nowrap;}
   .mini-btn svg{width:14px; height:14px; vertical-align:-2px; margin-right:3px;}
+.tablewrap{overflow-x:auto; -webkit-overflow-scrolling:touch; margin-top:8px; border:1px solid var(--line,rgba(255,255,255,.08)); border-radius:12px}
+.atable{width:100%; border-collapse:collapse; font-size:13px; min-width:520px}
+.atable th{text-align:left; font-size:11px; letter-spacing:.3px; text-transform:uppercase; color:var(--dim); font-weight:600; padding:9px 12px; background:var(--surface-2); position:sticky; top:0}
+.atable th.num,.atable td.num{text-align:right; width:52px}
+.atable td{padding:9px 12px; border-top:1px solid var(--line,rgba(255,255,255,.06)); vertical-align:top}
+.atable td.dim{color:var(--dim); font-size:12px}
+.atable tbody tr:not(.svc):hover{background:color-mix(in srgb, var(--accent,#6c7cff) 8%, transparent)}
+.atable tr.svc td{background:color-mix(in srgb, var(--accent,#6c7cff) 12%, var(--surface-2)); padding:7px 12px; border-top:2px solid var(--line,rgba(255,255,255,.1))}
+.atable .svcname{font-weight:700; letter-spacing:.2px}.atable .svcn{float:right; color:var(--dim); font-size:12px; font-weight:500}
 .cylrow{display:flex; align-items:center; gap:6px; flex-wrap:wrap; padding:6px 0; border-bottom:1px solid var(--line,rgba(255,255,255,.08))}.cylrow input{padding:7px 8px; font-size:12px; background:var(--surface-2); border:1px solid var(--line,rgba(255,255,255,.14)); border-radius:8px; color:inherit}.cyln{width:20px; text-align:center; color:var(--dim); font-size:12px; flex:none}
 .assethead{display:flex; align-items:center; justify-content:space-between; gap:12px; margin:4px 2px 14px; flex-wrap:wrap}.assethead .big{font-size:26px; font-weight:800; line-height:1}.assethead .small{font-size:12px; color:var(--dim)}
 .acc-row{display:flex; align-items:center; gap:8px; padding:9px 0; border-bottom:1px solid var(--line,rgba(255,255,255,.08)); font-size:13px}.acc-row .grow{flex:1; min-width:0}.acc-tag{font-size:11px; padding:2px 8px; border-radius:20px; background:var(--surface-2); flex:none}
@@ -552,6 +561,7 @@ async function enter(){
   catch(e){ state.syncError = saved ? 'showing the copy saved on this device' : 'load failed'; KINDS.forEach(k => state[k] = state[k] || []); }
   state.loaded = true;
   state.mode = 'sync';
+  if(state.role === 'staff') migrateAssets();
   if(state.role === 'staff') loadBackupEmail().then(() => softRender());
   render();
   startRealtime();
@@ -823,8 +833,27 @@ async function deleteReport(id){
   render();
 }
 
-const ASSET_TYPES = ['CCTV Camera','NVR / DVR','Access Controller','Door Reader / Lock','Biometric Device','Fire Alarm Panel','Smoke / Heat Detector','Manual Call Point','Fire Extinguisher','FM200 System','PA Amplifier','PA Speaker','Boom Barrier','BMS Controller','Network Switch','UPS','Other'];
+const ASSET_TYPES = ['CCTV Camera','NVR / DVR','Access Controller','Door Reader / Lock','Biometric Device','Fire Alarm Panel','Smoke / Heat Detector','Manual Call Point','Hooter / Sounder','Fire Extinguisher','FM200 System','PA Amplifier','PA Speaker','Boom Barrier','BMS Controller','Network Switch','UPS','Other'];
 const ASSET_STATUS = ['Working','Faulty','Under repair','Removed'];
+const ASSET_SERVICE = {
+  'CCTV Camera':'CCTV','NVR / DVR':'CCTV',
+  'Access Controller':'Access Control','Door Reader / Lock':'Access Control',
+  'Biometric Device':'Biometrics',
+  'Fire Alarm Panel':'Fire Alarm System','Smoke / Heat Detector':'Fire Alarm System','Manual Call Point':'Fire Alarm System','Hooter / Sounder':'Fire Alarm System',
+  'Fire Extinguisher':'Fire Extinguisher',
+  'FM200 System':'FM200',
+  'PA Amplifier':'Public Addressing System','PA Speaker':'Public Addressing System',
+  'Boom Barrier':'Boom Barrier',
+  'BMS Controller':'BMS',
+  'Network Switch':'Network & Power','UPS':'Network & Power','Other':'Network & Power'
+};
+const SERVICE_ORDER = ['CCTV','Access Control','Fire Alarm System','Fire Extinguisher','FM200','Public Addressing System','Biometrics','BMS','Boom Barrier','Pneumatic Automation','Network & Power','Other'];
+async function migrateAssets(){
+  const fix = state.assets.filter(a => a.assetType === 'Other' && /hooter|sounder/i.test([a.location, a.notes, a.make, a.model].join(' ')));
+  for(const a of fix){ try{ await upsert('assets', {...a, assetType: 'Hooter / Sounder', location: /^hooters?$/i.test((a.location||'').trim()) ? '' : a.location}); }catch(e){} }
+  if(fix.length) softRender();
+}
+function serviceOf(a){ return ASSET_SERVICE[a && a.assetType] || 'Other'; }
 const FE_GASES = ['ABC','CO2','Water','Foam','Clean Agent','Mechanical Foam','DCP'];
 const FE_WEIGHTS = ['1kg','2kg','4kg','4.5kg','5kg','6kg','9kg','22.5kg'];
 const ASSET_STATUS_CLS = {Working:'ok', Faulty:'crit', 'Under repair':'warn', Removed:''};
@@ -1046,7 +1075,7 @@ function render(){
   const sub = state.tab === 'overview' && state.role === 'client' ? state.clientName
     : state.tab === 'overview'
     ? new Date().toLocaleDateString('en-IN',{weekday:'long', day:'numeric', month:'long'})
-    : ({contracts:`${state.contracts.length} contracts`, clients:`${state.clients.length} clients`, tickets:`${tabCount('tickets')} open`, reports:`${state.reports.length} reports`})[state.tab];
+    : ({contracts:`${state.contracts.length} contracts`, clients:`${state.clients.length} clients`, assets:`${scoped(state.assets).reduce((n,a)=>n+(a.status!=='Removed'?assetQty(a):0),0)} assets`, tickets:`${tabCount('tickets')} open`, reports:`${state.reports.length} reports`, certificates:`${scoped(state.certificates).length} certificates`})[state.tab] || '';
   app.innerHTML = `
     <div class="shell">
       <aside class="side">
@@ -1280,15 +1309,32 @@ function renderAssets(){
   const list = scoped(state.assets);
   if(!list.length) return emptyBox('box', 'No assets yet', state.readOnly ? 'Your equipment will appear here.' : 'Tap New asset, or import from a backup under Data.');
   const total = list.filter(a => a.status !== 'Removed').reduce((n,a) => n + assetQty(a), 0);
-  // group by client, then site
+  const q = (state.q||'').trim().toLowerCase();
   const byClient = new Map();
   list.forEach(a => { const c = a.client || 'Unassigned'; if(!byClient.has(c)) byClient.set(c, []); byClient.get(c).push(a); });
   const clients = [...byClient.keys()].sort((a,b) => a.localeCompare(b));
-  const q = (state.q||'').trim().toLowerCase();
-  const assetLine = a => `<div class="arow" onclick="${state.readOnly ? '' : `openModal('asset', ${escAttr(a)}, false)`}">
-      <div class="grow"><div class="t">${assetQty(a) > 1 ? assetQty(a) + ' × ' : ''}${esc(a.assetType||'Asset')}${a.make || a.model ? ' · ' + esc((a.make||'') + ' ' + (a.model||'')) : ''}${a.assetType==='Fire Extinguisher' && (a.feGas||a.feWeight) ? ` <span class="pill">${esc([a.feGas,a.feWeight].filter(Boolean).join(' '))}</span>` : ''}</div>
-      <div class="s">${[a.location, a.ip && ('IP ' + a.ip), a.serial && ('S/N ' + a.serial), a.warrantyEnd && ('Warranty ' + fmtDate(a.warrantyEnd))].filter(Boolean).map(esc).join(' · ') || '&nbsp;'}</div></div>
-      <span class="pill ${ASSET_STATUS_CLS[a.status||'Working']||''}">${esc(a.status||'Working')}</span></div>`;
+  const detail = a => [a.location, a.ip && ('IP ' + a.ip), a.serial && ('S/N ' + a.serial), (a.feGas||a.feWeight) && [a.feGas,a.feWeight].filter(Boolean).join(' '), a.warrantyEnd && ('Warranty ' + fmtDate(a.warrantyEnd)), a.notes].filter(Boolean).map(esc).join(' · ');
+  const siteTable = (items, cn) => {
+    // group by service in SERVICE_ORDER
+    const svc = new Map();
+    items.forEach(a => { const k = serviceOf(a); if(!svc.has(k)) svc.set(k, []); svc.get(k).push(a); });
+    const order = SERVICE_ORDER.filter(k => svc.has(k)).concat([...svc.keys()].filter(k => !SERVICE_ORDER.includes(k)));
+    const rows = order.map(k => {
+      const its = svc.get(k).slice().sort((a,b)=> (a.assetType||'').localeCompare(b.assetType||''));
+      const n = its.reduce((x,a)=>x+assetQty(a),0);
+      const head = `<tr class="svc"><td colspan="5"><span class="svcname">${esc(k)}</span><span class="svcn">${n} unit${n===1?'':'s'}</span></td></tr>`;
+      const body = its.map(a => `<tr ${state.readOnly?'':`onclick="openModal('asset', ${escAttr(a)}, false)" style="cursor:pointer"`}>
+        <td><b>${assetQty(a)>1?assetQty(a)+' × ':''}</b>${esc(a.assetType||'Asset')}</td>
+        <td class="num">${assetQty(a)}</td>
+        <td>${esc([a.make,a.model].filter(Boolean).join(' '))||'&mdash;'}</td>
+        <td class="dim">${detail(a)||'&mdash;'}</td>
+        <td><span class="pill ${ASSET_STATUS_CLS[a.status||'Working']||''}">${esc(a.status||'Working')}</span></td></tr>`).join('');
+      return head + body;
+    }).join('');
+    return `<div class="tablewrap"><table class="atable">
+      <thead><tr><th>Item</th><th class="num">Qty</th><th>Make / Model</th><th>Details</th><th>Status</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+  };
   const body = clients.map(cn => {
     const cl = byClient.get(cn);
     const sites = [...new Set(cl.map(a => a.site || 'No site set'))].sort((a,b) => a.localeCompare(b));
@@ -1296,19 +1342,27 @@ function renderAssets(){
       let items = cl.filter(a => (a.site || 'No site set') === site);
       if(q) items = items.filter(matchQ);
       if(!items.length) return '';
-      const sum = assetSummary(items);
+      const n = items.reduce((x,a)=>x+(a.status!=='Removed'?assetQty(a):0),0);
       return `<div class="siteblk">
-        <div class="sitehead"><div><div class="t">${esc(site)}</div><div class="s">${sum.reduce((n,[,k]) => n + k, 0)} assets</div></div>
-          <button class="mini-btn" onclick="copyText(${escAttr(assetSummaryText(items, cn, site))}, 'Summary copied')">${ic('copy')} Copy</button></div>
-        ${sum.length ? `<div class="chips2">${sum.map(([t,n]) => `<span class="pill accent">${n} × ${esc(t)}</span>`).join('')}</div>` : ''}
-        ${items.map(assetLine).join('')}</div>`;
+        <div class="sitehead"><div><div class="t">${esc(site)}</div><div class="s">${n} units · ${new Set(items.map(serviceOf)).size} services</div></div>
+          <button class="mini-btn" onclick="copyText(${escAttr(serviceSummaryText(items, cn, site))}, 'Summary copied')">${ic('copy')} Copy for quote</button></div>
+        ${siteTable(items, cn)}</div>`;
     }).join('');
     if(!blocks.trim()) return '';
     return `<div class="panel"><div class="sec"><h2>${avatarMini(cn)} ${esc(cn)}</h2><button class="mini-btn" onclick="openClientByName(${escAttr(cn)})">Open file</button></div>${blocks}</div>`;
   }).join('');
-  return listToolbar(null) + `<div class="assethead"><div><div class="big">${total}</div><div class="small">assets across ${clients.length} client${clients.length===1?'':'s'}</div></div>
-    ${state.readOnly ? `<button class="btn btn-ghost" onclick="exportAssetsCSV()">${ic('download')} Export my assets</button>` : `<button class="btn btn-ghost" onclick="exportAssetsCSV()">${ic('download')} Export CSV</button>`}</div>
+  return listToolbar(null) + `<div class="assethead"><div><div class="big">${total}</div><div class="small">units across ${clients.length} client${clients.length===1?'':'s'}, grouped by service</div></div>
+    <button class="btn btn-ghost" onclick="exportAssetsCSV()">${ic('download')} ${state.readOnly?'Export my assets':'Export CSV'}</button></div>
     <div class="grid" style="gap:16px">${body || emptyBox('box','No matches','Try a different search.')}</div>`;
+}
+// Service-grouped summary for AMC quoting
+function serviceSummaryText(items, client, site){
+  const svc = new Map();
+  items.filter(a=>a.status!=='Removed').forEach(a => { const k = serviceOf(a); if(!svc.has(k)) svc.set(k, new Map()); const m = svc.get(k); m.set(a.assetType||'Other', (m.get(a.assetType||'Other')||0)+assetQty(a)); });
+  const order = SERVICE_ORDER.filter(k => svc.has(k)).concat([...svc.keys()].filter(k=>!SERVICE_ORDER.includes(k)));
+  const L = [`${client} — ${site}`, ''];
+  order.forEach(k => { const m = svc.get(k); const tot=[...m.values()].reduce((a,b)=>a+b,0); L.push(`${k} (${tot}):`); [...m.entries()].sort((a,b)=>b[1]-a[1]).forEach(([t,n])=>L.push(`   ${n} × ${t}`)); });
+  return L.join('\n');
 }
 function avatarMini(name){ const h=hueOf(name); return `<span class="avatar sm" style="background:linear-gradient(135deg,hsl(${h} 72% 58%),hsl(${(h+45)%360} 70% 46%)); width:26px; height:26px; font-size:11px; display:inline-flex; vertical-align:middle">${esc(initials(name))}</span>`; }
 function assetSummaryText(list, client, site){
