@@ -343,6 +343,11 @@
   .issue svg{width:15px; height:15px; margin-top:1px;}
   .report-toolbar button.act.primary{white-space:nowrap;}
   .mini-btn svg{width:14px; height:14px; vertical-align:-2px; margin-right:3px;}
+.cylrow{display:flex; align-items:center; gap:6px; flex-wrap:wrap; padding:6px 0; border-bottom:1px solid var(--line,rgba(255,255,255,.08))}.cylrow input{padding:7px 8px; font-size:12px; background:var(--surface-2); border:1px solid var(--line,rgba(255,255,255,.14)); border-radius:8px; color:inherit}.cyln{width:20px; text-align:center; color:var(--dim); font-size:12px; flex:none}
+.assethead{display:flex; align-items:center; justify-content:space-between; gap:12px; margin:4px 2px 14px; flex-wrap:wrap}.assethead .big{font-size:26px; font-weight:800; line-height:1}.assethead .small{font-size:12px; color:var(--dim)}
+.acc-row{display:flex; align-items:center; gap:8px; padding:9px 0; border-bottom:1px solid var(--line,rgba(255,255,255,.08)); font-size:13px}.acc-row .grow{flex:1; min-width:0}.acc-tag{font-size:11px; padding:2px 8px; border-radius:20px; background:var(--surface-2); flex:none}
+.branchpick{display:flex; flex-wrap:wrap; gap:8px; margin:8px 0}
+.checks{display:flex; flex-wrap:wrap; gap:8px}.check{display:inline-flex; align-items:center; gap:8px; padding:9px 12px; border:1px solid var(--line,rgba(255,255,255,.12)); border-radius:12px; background:var(--surface-2); cursor:pointer; font-size:13px; font-weight:500; color:var(--text,inherit); margin:0 !important; user-select:none}.check input{width:18px; height:18px; margin:0; accent-color:var(--accent,#6c7cff)}.check:has(input:checked){border-color:var(--accent,#6c7cff); background:color-mix(in srgb, var(--accent,#6c7cff) 16%, var(--surface-2))}fieldset.ro{border:0; padding:0; margin:0; min-width:0}
 .client-hint{font-size:12px;margin-top:5px;min-height:0}.client-hint:empty{display:none}.client-hint.ok{color:var(--ok)}.client-hint.warn{color:var(--warn)}
 </style>
 </head>
@@ -392,16 +397,22 @@ let state = {
   _count: true,
   backupBusy: false,
   readOnly: false,
+  role: 'staff',      // 'staff' | 'client' | 'none'
+  clientName: '',
+  clientSites: [],    // branches a client may see ([] = all)
   mode: 'loading', // 'sync' (shared database) or 'local' (this device only)
   syncError: null,
   confirmReportDelete: false,
   reportView: null, // report object currently open in full-screen preview
+  certView: null,
+  confirmCertDelete: false,
+  access: {loaded:false, list:[], email:'', company:'', sites:[], busy:false, msg:null},
   filter: 'all'
 };
 
 // ---- Data layer: Supabase (Postgres + Realtime + Auth) ----
-const KINDS = ['contracts', 'clients', 'tickets', 'reports', 'assets', 'notes'];
-const KIND_OF = {contract:'contracts', client:'clients', ticket:'tickets', reportForm:'reports', asset:'assets', note:'notes'};
+const KINDS = ['contracts', 'clients', 'tickets', 'reports', 'assets', 'notes', 'certificates'];
+const KIND_OF = {contract:'contracts', client:'clients', ticket:'tickets', reportForm:'reports', asset:'assets', note:'notes', certForm:'certificates'};
 let SB = null, SAMPLE = null, DOWNLOADS = null;
 const firstSeen = new Set();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -416,7 +427,7 @@ function toast(text){
 
 // Live updates must never wipe a form someone is filling in
 function softRender(){
-  if(state.modal || state.dataOpen || state.reportView) return;
+  if(state.modal || state.dataOpen || state.reportView || state.certView) return;
   render();
 }
 
@@ -427,7 +438,7 @@ const CACHE_KEY = 'conx-ops-data';
 let _cacheT = null;
 function saveCache(){
   clearTimeout(_cacheT);
-  _cacheT = setTimeout(() => { try{ const o = {v: APP_VERSION, at: Date.now()}; KINDS.forEach(k => o[k] = state[k]); localStorage.setItem(CACHE_KEY, JSON.stringify(o)); }catch(e){} }, 300);
+  _cacheT = setTimeout(() => { try{ const o = {v: APP_VERSION, at: Date.now(), role: state.role, clientName: state.clientName, clientSites: state.clientSites}; KINDS.forEach(k => o[k] = state[k]); localStorage.setItem(CACHE_KEY, JSON.stringify(o)); }catch(e){} }, 300);
 }
 function readCache(){ try{ const o = JSON.parse(localStorage.getItem(CACHE_KEY) || 'null'); return (o && KINDS.every(k => Array.isArray(o[k]))) ? o : null; }catch(e){ return null; } }
 function clearCache(){ try{ localStorage.removeItem(CACHE_KEY); }catch(e){} }
@@ -495,13 +506,45 @@ async function signOut(){
   await SB.auth.signOut();
   if(channel){ SB.removeChannel(channel); channel = null; }
   clearCache();
+  state.role = 'staff'; state.clientName = ''; state.clientSites = []; state.readOnly = false;
   KINDS.forEach(k => state[k] = []);
   state.loaded = false; state.needLogin = true; state.modal = null; state.dataOpen = false; state.reportView = null;
   render();
 }
 
+// Staff see and edit everything. A client login is tied to one company and is view-only.
+async function loadRole(){
+  const cached = readCache();
+  state.role = 'staff'; state.clientName = ''; state.clientSites = []; state.readOnly = false;
+  try{
+    const {data:{session}} = await SB.auth.getSession();
+    const uid = session && session.user && session.user.id; if(!uid) return;
+    const c = await SB.from('portal_access').select('client_name,sites').eq('user_id', uid).maybeSingle();
+    if(c.error){
+      if(/42P01|PGRST205|does not exist|schema cache/i.test(JSON.stringify(c.error))) return;   // roles not set up yet: everyone is staff
+      throw c.error;
+    }
+    if(c.data && c.data.client_name){ state.role = 'client'; state.clientName = c.data.client_name; state.clientSites = Array.isArray(c.data.sites) ? c.data.sites : []; state.readOnly = true; return; }
+    const st = await SB.from('staff_users').select('user_id').eq('user_id', uid).maybeSingle();
+    if(st.error) throw st.error;
+    if(!st.data) state.role = 'none';
+  }catch(e){
+    // offline: fall back to the role last seen on this device
+    if(cached && cached.role === 'client'){ state.role = 'client'; state.clientName = cached.clientName || ''; state.clientSites = cached.clientSites || []; state.readOnly = true; }
+  }
+}
+function noAccessHTML(){
+  return `<div class="login"><div style="max-width:380px; text-align:center">
+    <img class="brandlogo" style="height:46px; margin-bottom:12px" src="${CX_ICON_URI}" alt="">
+    <h2 style="margin:0 0 8px">No access yet</h2>
+    <div class="s" style="margin-bottom:16px">This login has not been given access. Ask Conx Systems to enable it, then sign in again.</div>
+    <button class="btn btn-primary" style="width:100%" onclick="signOut()">Sign out</button></div></div>`;
+}
+
 async function enter(){
   state.needLogin = false; state.loaded = false; state.syncError = null;
+  await loadRole();
+  if(state.role === 'none'){ state.loaded = true; render(); return; }
   const saved = readCache();   // show the copy on this device straight away
   if(saved){ KINDS.forEach(k => state[k] = saved[k]); state.loaded = true; }
   render();
@@ -509,7 +552,7 @@ async function enter(){
   catch(e){ state.syncError = saved ? 'showing the copy saved on this device' : 'load failed'; KINDS.forEach(k => state[k] = state[k] || []); }
   state.loaded = true;
   state.mode = 'sync';
-  loadBackupEmail().then(() => softRender());
+  if(state.role === 'staff') loadBackupEmail().then(() => softRender());
   render();
   startRealtime();
 }
@@ -639,7 +682,7 @@ function createVisitReport(contractId){
   const c = state.contracts.find(x => x.id === contractId); if(!c) return;
   const cl = state.clients.find(x => lc(x.name) === lc(c.client));
   state.clientView = state.clientView; // keep client file open underneath
-  openReportForm({client: c.client, site: c.site || '', natureOfCall: 'PMS', systemAttended: SYSTEM_TYPES.includes(c.systemType) ? c.systemType : SYSTEM_TYPES[0], pmsDescription: 'Preventive Maintenance of ' + (c.systemType || 'system'), serviceDate: new Date().toISOString().slice(0,10), clientAddress: clientAddr(cl), contactName: cl ? (cl.contactPerson||'') : '', contactNumber: cl ? (cl.phone||'') : '', contactDepartment: cl ? (cl.department||'') : ''});
+  openReportForm({client: c.client, site: c.site || '', natureOfCall: 'PMS', systemAttended: SYSTEM_TYPES.includes(systemsOf(c)[0]) ? systemsOf(c)[0] : SYSTEM_TYPES[0], pmsDescription: 'Preventive Maintenance of ' + (c.systemType || 'system'), serviceDate: new Date().toISOString().slice(0,10), clientAddress: clientAddr(cl), contactName: cl ? (cl.contactPerson||'') : '', contactNumber: cl ? (cl.phone||'') : '', contactDepartment: cl ? (cl.department||'') : ''});
 }
 function goFilter(tab, f){ state.tab = tab; state.filter = f; state.q = ''; render(); const m = document.getElementById('main'); if(m){ m.classList.add('anim'); setTimeout(() => m.classList.remove('anim'), 900); } }
 function onSearch(v){ state.q = v; const el = document.getElementById('listArea'); if(el) el.innerHTML = listHTML(); }
@@ -666,7 +709,7 @@ async function renewContract(id){
 document.addEventListener('keydown', e => {
   const tag = (e.target && e.target.tagName) || '';
   if(e.key === 'Escape'){
-    if(state.modal) closeModal(); else if(state.dataOpen) closeData(); else if(state.reportView) closeReportPreview(); else if(state.clientView) closeClient();
+    if(state.modal) closeModal(); else if(state.dataOpen) closeData(); else if(state.reportView) closeReportPreview(); else if(state.certView) closeCert(); else if(state.clientView) closeClient();
   } else if(e.key === '/' && !/INPUT|TEXTAREA|SELECT/.test(tag)){
     const el = document.getElementById('searchInput'); if(el){ e.preventDefault(); el.focus(); }
   }
@@ -688,7 +731,8 @@ const REQUIRED_FIELDS = {
   ticket: [['client','Client'], ['issue','Issue']],
   reportForm: [['client','Client'], ['workCarriedOut','Work carried out']],
   asset: [['client','Client'], ['assetType','Asset type']],
-  note: [['client','Client'], ['title','Title']]
+  note: [['client','Client'], ['title','Title']],
+  certForm: [['client','Client'], ['site','Site'], ['certNo','Certificate no.']]
 };
 
 async function submitModal(e){
@@ -699,9 +743,12 @@ async function submitModal(e){
   const obj = {};
   fd.forEach((v,k) => obj[k] = (k === 'password' || typeof v !== 'string') ? v : v.trim());
   const {type, isNew} = state.modal;
+  if(type === 'contract'){ obj.systemTypes = fd.getAll('systemTypes'); obj.systemType = obj.systemTypes.join(', '); }
+  if(type === 'certForm'){ obj.rows = gatherCylinders(form); }
 
   const reqs = REQUIRED_FIELDS[type] || [];
   const missing = reqs.filter(([key]) => !(obj[key] || '').trim()).map(([,label]) => label);
+  if(type === 'contract' && !obj.systemTypes.length) missing.push('At least one system');
   if(missing.length){
     state.modal.data = {...state.modal.data, ...obj};   // keep what was typed
     state.modal.error = `Please fill in: ${missing.join(', ')}`;
@@ -734,6 +781,12 @@ async function submitModal(e){
   if(type === 'reportForm'){
     state.modal = null;
     state.reportView = obj;
+    render();
+    return;
+  }
+  if(type === 'certForm'){
+    state.modal = null;
+    state.certView = obj;
     render();
     return;
   }
@@ -772,6 +825,8 @@ async function deleteReport(id){
 
 const ASSET_TYPES = ['CCTV Camera','NVR / DVR','Access Controller','Door Reader / Lock','Biometric Device','Fire Alarm Panel','Smoke / Heat Detector','Manual Call Point','Fire Extinguisher','FM200 System','PA Amplifier','PA Speaker','Boom Barrier','BMS Controller','Network Switch','UPS','Other'];
 const ASSET_STATUS = ['Working','Faulty','Under repair','Removed'];
+const FE_GASES = ['ABC','CO2','Water','Foam','Clean Agent','Mechanical Foam','DCP'];
+const FE_WEIGHTS = ['1kg','2kg','4kg','4.5kg','5kg','6kg','9kg','22.5kg'];
 const ASSET_STATUS_CLS = {Working:'ok', Faulty:'crit', 'Under repair':'warn', Removed:''};
 const FREQ = {'Monthly':1, 'Quarterly':3, 'Half-yearly':6, 'Yearly':12};
 const lc = x => String(x||'').trim().toLowerCase();
@@ -819,6 +874,11 @@ function sitesOf(clientName){
   [state.contracts, state.assets, state.notes, state.reports, state.tickets].forEach(list => list.forEach(x => { if(lc(x.client) === lc(clientName)) add(x.site); }));
   return [...set.values()];
 }
+function systemsOf(c){
+  if(!c) return [];
+  if(Array.isArray(c.systemTypes) && c.systemTypes.length) return c.systemTypes.filter(Boolean);
+  return String(c.systemType || '').split(/\s*,\s*/).filter(Boolean);
+}
 function findClient(name){ const n = lc(name); return n ? state.clients.find(c => lc(c.name) === n) || null : null; }
 function clientAddr(cl){ return cl ? String(cl.address || cl.sites || '').trim() : ''; }
 // Fill the contact/address fields of an open form from the chosen client.
@@ -852,7 +912,13 @@ function onSiteInput(el){
   const sys = form.elements['systemAttended']; const cEl = form.elements['client'];
   if(!sys || !cEl || form.dataset.sysTouched) return;
   const m = state.contracts.find(c => lc(c.client) === lc(cEl.value) && el.value.trim() && lc(c.site) === lc(el.value));
-  if(m && SYSTEM_TYPES.includes(m.systemType) && sys.value !== m.systemType){ sys.value = m.systemType; autofillPmsDesc(m.systemType); }
+  const ms = systemsOf(m)[0]; if(m && SYSTEM_TYPES.includes(ms) && !systemsOf(m).includes(sys.value)){ sys.value = ms; autofillPmsDesc(ms); }
+}
+function scoped(list){
+  if(state.role !== 'client') return list;
+  const cn = lc(state.clientName);
+  const sites = (state.clientSites||[]).map(lc);
+  return list.filter(x => lc(x.client) === cn && (!sites.length || !x.site || sites.includes(lc(x.site))));
 }
 function allSites(){ const set = new Set(); [state.contracts, state.assets, state.notes].forEach(l => l.forEach(x => { if(x.site) set.add(x.site); })); return [...set]; }
 function issuesOf(r){ return String(r.workCarriedOut||'').split('\n').map(l => l.trim()).filter(l => l.startsWith('!')).map(l => l.replace(/^!\s*/, '')); }
@@ -916,6 +982,9 @@ function copySiteSummary(cid, idx){
   copyText(lines.join('\n'), 'Site asset summary copied');
 }
 const ICONS = {
+  download:'<path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/>',
+  flame:'<path d="M12 2c1 3 4 4 4 8a4 4 0 0 1-8 0c0-1 .3-2 1-3 .2 1 .8 1.6 1.5 1.8C10 7 11 4 12 2z"/><path d="M8.5 14a3.5 3.5 0 0 0 7 0"/>',
+  cert:'<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
   home:'<path d="M3 11l9-8 9 8v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
   shield:'<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M9 12l2 2 4-4"/>',
   users:'<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6"/><circle cx="17.5" cy="9" r="2.5"/><path d="M17.5 14c2.7.2 4 2.2 4 5"/>',
@@ -948,9 +1017,10 @@ function termPct(c){ const a=new Date(c.startDate), b=new Date(c.endDate); if(!(
 function esc(s){ return (s||'').toString().replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 function fmtDate(d){ if(!d) return ''; const dt = new Date(d); return dt.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}); }
 
-const TABS = [['overview','Overview','home'],['contracts','AMC','shield'],['clients','Clients','users'],['tickets','Tickets','tool'],['reports','Reports','file']];
-const TITLES = {overview:'Overview', contracts:'AMC Contracts', clients:'Clients', tickets:'Service Tickets', reports:'Service Reports'};
-const NEW_LABEL = {contracts:'New contract', clients:'New client', tickets:'New ticket', reports:'New report'};
+function tabsFor(){ return state.role === 'client' ? TABS.map(t => t[0] === 'clients' ? ['clients','My company','users'] : t) : TABS; }
+const TABS = [['overview','Overview','home'],['contracts','AMC','shield'],['clients','Clients','users'],['assets','Assets','box'],['tickets','Tickets','tool'],['reports','Reports','file'],['certificates','FE Certs','flame']];
+const TITLES = {overview:'Overview', contracts:'AMC Contracts', get clients(){ return state.role === 'client' ? 'My company' : 'Clients'; }, assets:'Assets', tickets:'Service Tickets', reports:'Service Reports', certificates:'FE Certificates'};
+const NEW_LABEL = {contracts:'New contract', clients:'New client', assets:'New asset', tickets:'New ticket', reports:'New report', certificates:'New certificate'};
 
 function tabCount(id){
   if(id==='contracts') return state.contracts.length;
@@ -963,6 +1033,7 @@ function tabCount(id){
 function render(){
   const app = document.getElementById('app');
   if(state.needLogin){ app.innerHTML = loginHTML(); return; }
+  if(state.role === 'none'){ app.innerHTML = noAccessHTML(); return; }
   if(!state.loaded){
     app.innerHTML = `<div class="page" style="padding:40px 20px; max-width:900px; margin:0 auto;"><div class="grid" style="gap:14px"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div></div>`;
     return;
@@ -972,21 +1043,22 @@ function render(){
     : state.readOnly ? ['neutral','View only']
     : ['ok','Synced live'];
   const canAdd = state.tab !== 'overview' && !state.readOnly;
-  const sub = state.tab === 'overview'
+  const sub = state.tab === 'overview' && state.role === 'client' ? state.clientName
+    : state.tab === 'overview'
     ? new Date().toLocaleDateString('en-IN',{weekday:'long', day:'numeric', month:'long'})
     : ({contracts:`${state.contracts.length} contracts`, clients:`${state.clients.length} clients`, tickets:`${tabCount('tickets')} open`, reports:`${state.reports.length} reports`})[state.tab];
   app.innerHTML = `
     <div class="shell">
       <aside class="side">
-        <div class="brandrow"><img class="brandlogo" style="height:40px" src="${CX_ICON_URI}" alt=""><div><div class="mark">CONX OPS</div><div class="tag">Field systems</div></div></div>
+        <div class="brandrow"><img class="brandlogo" style="height:40px" src="${CX_ICON_URI}" alt=""><div><div class="mark">CONX OPS</div><div class="tag">${state.role === 'client' ? 'Client portal' : 'Field systems'}</div></div></div>
         <nav>
-          ${TABS.map(([id,label,icon]) => `<button class="${state.tab===id?'active':''}" onclick="setTab('${id}')">${ic(icon)}<span>${label}</span>${tabCount(id)!=='' ? `<span class="cnt">${tabCount(id)}</span>` : ''}</button>`).join('')}
+          ${tabsFor().map(([id,label,icon]) => `<button class="${state.tab===id?'active':''}" onclick="setTab('${id}')">${ic(icon)}<span>${label}</span>${tabCount(id)!=='' ? `<span class="cnt">${tabCount(id)}</span>` : ''}</button>`).join('')}
         </nav>
         <div class="spacer"></div>
         <div class="sidefoot">
           <div class="sync ${chip[0]}" style="padding:4px 12px 2px"><i></i>${chip[1]}</div>
           <div style="padding:0 12px 8px; font-size:11px; color:var(--muted,#8b8fa8)">Conx Ops ${APP_VERSION}</div>
-          <button onclick="openData()">${ic('db')}Data &amp; backup</button>
+          ${state.role === 'client' ? '' : `<button onclick="openData()">${ic('db')}Data &amp; backup</button>`}
           <button onclick="signOut()">${ic('logout')}Sign out</button>
         </div>
       </aside>
@@ -996,7 +1068,7 @@ function render(){
           <div class="ttl"><h1>${TITLES[state.tab]}</h1><div class="sub">${sub}</div></div>
           <div class="mactions" style="display:flex; gap:8px; align-items:center;">
             <span class="sync ${chip[0]}" title="${chip[1]}"><i></i></span>
-            <button class="iconbtn" onclick="openData()" aria-label="Data">${ic('db')}</button>
+            ${state.role === 'client' ? '' : `<button class="iconbtn" onclick="openData()" aria-label="Data">${ic('db')}</button>`}
             <button class="iconbtn" onclick="signOut()" aria-label="Sign out">${ic('logout')}</button>
           </div>
           ${canAdd ? `<button class="newbtn" onclick="handleAdd()">${ic('plus')}${NEW_LABEL[state.tab]}</button>` : ''}
@@ -1008,14 +1080,16 @@ function render(){
     </div>
     ${canAdd ? `<button class="fab" onclick="handleAdd()" aria-label="New">${ic('plus')}</button>` : ''}
     <nav class="tabs">
-      ${TABS.map(([id,label,icon]) => `<button class="${state.tab===id?'active':''}" onclick="setTab('${id}')">${ic(icon)}<span>${label}</span></button>`).join('')}
+      ${tabsFor().map(([id,label,icon]) => `<button class="${state.tab===id?'active':''}" onclick="setTab('${id}')">${ic(icon)}<span>${label}</span></button>`).join('')}
     </nav>
     ${state.clientView ? renderClientDetail() : ''}
     ${state.modal ? renderModal() : ''}
     ${state.dataOpen ? renderDataModal() : ''}
     ${state.reportView ? renderReportPreview() : ''}
+    ${state.certView ? renderCertPreview() : ''}
   `;
   if(state.reportView){ fitSheet(); setTimeout(() => { if(state.reportView) fitSheet(); }, 250); }
+  if(state.certView){ fitSheet(); setTimeout(() => { if(state.certView) fitSheet(); }, 250); }
   runVisuals();
   if(state.modal){ const ci = document.querySelector('.modal form [name="client"]'); if(ci) onClientInput(ci); }
 }
@@ -1040,6 +1114,8 @@ function handleAdd(){
   if(state.tab==='clients') openModal('client', {}, true);
   if(state.tab==='tickets') openModal('ticket', {}, true);
   if(state.tab==='reports') openModal('reportForm', {}, true);
+  if(state.tab==='assets') openModal('asset', {}, true);
+  if(state.tab==='certificates') openModal('certForm', newCert(), true);
 }
 
 function renderTab(){
@@ -1048,6 +1124,8 @@ function renderTab(){
   if(state.tab === 'clients') return renderClients();
   if(state.tab === 'tickets') return renderTickets();
   if(state.tab === 'reports') return renderReports();
+  if(state.tab === 'assets') return renderAssets();
+  if(state.tab === 'certificates') return renderCertificates();
 }
 
 function renderOverview(){
@@ -1068,7 +1146,7 @@ function renderOverview(){
   const attention = [...dueSoon.map(c => contractCard(c)), ...highPriority.map(t => ticketCard(t))];
 
   return `
-    <div class="hero"><div class="hi">${greeting()}, <span>Conx Systems</span></div><p>Here is what needs you today.</p></div>
+    <div class="hero"><div class="hi">${greeting()}, <span>${state.role === 'client' ? esc(state.clientName) : 'Conx Systems'}</span></div><p>${state.role === 'client' ? 'Your AMC, service reports and equipment, all in one place.' : 'Here is what needs you today.'}</p></div>
     <div class="kpis">
       <button class="kpi ${dueSoon.length?'warn':'ok'}" onclick="goFilter('contracts','due')"><div class="ico">${ic('shield')}</div><div class="n" data-count="${dueSoon.length}">${dueSoon.length}</div><div class="l">AMC renewals due</div></button>
       <button class="kpi ${highPriority.length?'crit':''}" onclick="goFilter('tickets','Open')"><div class="ico">${ic('tool')}</div><div class="n" data-count="${openTickets.length}">${openTickets.length}</div><div class="l">Open tickets${highPriority.length ? ` · ${highPriority.length} urgent` : ''}</div></button>
@@ -1080,7 +1158,7 @@ function renderOverview(){
       <button onclick="quickNew('ticket')"><span class="qi">${ic('tool')}</span>Log ticket</button>
       <button onclick="quickNew('contract')"><span class="qi">${ic('shield')}</span>Add AMC</button>
     </div>`}
-    ${visits.length ? `<div class="sec"><h2>Preventive visits to schedule</h2></div>
+    ${visits.length ? `<div class="sec"><h2>${state.role === 'client' ? 'Preventive visits' : 'Preventive visits to schedule'}</h2></div>
     <div class="panel" style="padding:6px 16px; margin-bottom:18px">${visits.slice(0,6).map(({c,v}) => `<div class="row-item" onclick="openClientByName(${escAttr(c.client)})">${avatar(c.client)}<div class="grow"><div class="t">${esc(c.client)}${c.site ? ' · ' + esc(c.site) : ''}</div><div class="s">${v.label} visit · ${esc(c.systemType||'')} · ${v.status==='overdue' ? 'was due by ' + fmtDate(v.end) : 'from ' + fmtDate(v.start)}</div></div><span class="pill ${VISIT_CLS[v.status]}">${VISIT_TXT[v.status]}</span>${state.readOnly ? '' : `<button class="mini-btn go" onclick="event.stopPropagation(); createVisitReport('${c.id}')">Create report</button>`}</div>`).join('')}</div>` : ''}
     <div class="two">
       <div>
@@ -1196,6 +1274,109 @@ function ticketCard(t){
     </div>`;
 }
 function renderReports(){ return listToolbar(null) + `<div id="listArea">${listHTML()}</div>`; }
+
+// ---------- Assets tab (grouped by site) ----------
+function renderAssets(){
+  const list = scoped(state.assets);
+  if(!list.length) return emptyBox('box', 'No assets yet', state.readOnly ? 'Your equipment will appear here.' : 'Tap New asset, or import from a backup under Data.');
+  const total = list.filter(a => a.status !== 'Removed').reduce((n,a) => n + assetQty(a), 0);
+  // group by client, then site
+  const byClient = new Map();
+  list.forEach(a => { const c = a.client || 'Unassigned'; if(!byClient.has(c)) byClient.set(c, []); byClient.get(c).push(a); });
+  const clients = [...byClient.keys()].sort((a,b) => a.localeCompare(b));
+  const q = (state.q||'').trim().toLowerCase();
+  const assetLine = a => `<div class="arow" onclick="${state.readOnly ? '' : `openModal('asset', ${escAttr(a)}, false)`}">
+      <div class="grow"><div class="t">${assetQty(a) > 1 ? assetQty(a) + ' × ' : ''}${esc(a.assetType||'Asset')}${a.make || a.model ? ' · ' + esc((a.make||'') + ' ' + (a.model||'')) : ''}${a.assetType==='Fire Extinguisher' && (a.feGas||a.feWeight) ? ` <span class="pill">${esc([a.feGas,a.feWeight].filter(Boolean).join(' '))}</span>` : ''}</div>
+      <div class="s">${[a.location, a.ip && ('IP ' + a.ip), a.serial && ('S/N ' + a.serial), a.warrantyEnd && ('Warranty ' + fmtDate(a.warrantyEnd))].filter(Boolean).map(esc).join(' · ') || '&nbsp;'}</div></div>
+      <span class="pill ${ASSET_STATUS_CLS[a.status||'Working']||''}">${esc(a.status||'Working')}</span></div>`;
+  const body = clients.map(cn => {
+    const cl = byClient.get(cn);
+    const sites = [...new Set(cl.map(a => a.site || 'No site set'))].sort((a,b) => a.localeCompare(b));
+    const blocks = sites.map(site => {
+      let items = cl.filter(a => (a.site || 'No site set') === site);
+      if(q) items = items.filter(matchQ);
+      if(!items.length) return '';
+      const sum = assetSummary(items);
+      return `<div class="siteblk">
+        <div class="sitehead"><div><div class="t">${esc(site)}</div><div class="s">${sum.reduce((n,[,k]) => n + k, 0)} assets</div></div>
+          <button class="mini-btn" onclick="copyText(${escAttr(assetSummaryText(items, cn, site))}, 'Summary copied')">${ic('copy')} Copy</button></div>
+        ${sum.length ? `<div class="chips2">${sum.map(([t,n]) => `<span class="pill accent">${n} × ${esc(t)}</span>`).join('')}</div>` : ''}
+        ${items.map(assetLine).join('')}</div>`;
+    }).join('');
+    if(!blocks.trim()) return '';
+    return `<div class="panel"><div class="sec"><h2>${avatarMini(cn)} ${esc(cn)}</h2><button class="mini-btn" onclick="openClientByName(${escAttr(cn)})">Open file</button></div>${blocks}</div>`;
+  }).join('');
+  return listToolbar(null) + `<div class="assethead"><div><div class="big">${total}</div><div class="small">assets across ${clients.length} client${clients.length===1?'':'s'}</div></div>
+    ${state.readOnly ? `<button class="btn btn-ghost" onclick="exportAssetsCSV()">${ic('download')} Export my assets</button>` : `<button class="btn btn-ghost" onclick="exportAssetsCSV()">${ic('download')} Export CSV</button>`}</div>
+    <div class="grid" style="gap:16px">${body || emptyBox('box','No matches','Try a different search.')}</div>`;
+}
+function avatarMini(name){ const h=hueOf(name); return `<span class="avatar sm" style="background:linear-gradient(135deg,hsl(${h} 72% 58%),hsl(${(h+45)%360} 70% 46%)); width:26px; height:26px; font-size:11px; display:inline-flex; vertical-align:middle">${esc(initials(name))}</span>`; }
+function assetSummaryText(list, client, site){
+  const sum = assetSummary(list);
+  return `${client} — ${site}\n` + sum.map(([t,n]) => `${n} × ${t}`).join('\n');
+}
+function exportAssetsCSV(){
+  const rows = scoped(state.assets);
+  if(!rows.length){ toast('No assets to export'); return; }
+  const cols = ['client','site','location','assetType','qty','make','model','serial','ip','feGas','feWeight','installDate','warrantyEnd','status','notes'];
+  const head = ['Client','Site','Location','Type','Qty','Make','Model','Serial','IP','FE Gas','FE Weight','Installed','Warranty','Status','Notes'];
+  const lines = [head.join(',')].concat(rows.slice().sort((a,b)=>(a.client||'').localeCompare(b.client||'')||(a.site||'').localeCompare(b.site||'')).map(r => cols.map(c => csvCell(r[c])).join(',')));
+  saveFile(`conx-assets-${stamp()}.csv`, '﻿' + lines.join('\r\n'), 'text/csv');
+}
+
+// ---------- FE Certificates tab ----------
+function newCert(prefill){
+  const d = new Date(); const iso = x => x.toISOString().slice(0,10);
+  const due = new Date(d); due.setFullYear(due.getFullYear() + 1);
+  return Object.assign({
+    certNo: suggestCertNo(), testDate: iso(d), dueDate: iso(due),
+    party: '', client: '', site: '', testedBy: 'Conx Systems', rows: []
+  }, prefill || {});
+}
+function suggestCertNo(){
+  const yr = new Date().getFullYear();
+  let max = 0;
+  state.certificates.forEach(c => { const s = String(c.certNo||''); const m = s.match(/(\d+)\s*\/\s*\d{4}\s*$/) || s.match(/(\d+)(?!.*\d)/); if(m){ const n = +m[1]; if(n > max) max = n; } });
+  return `CX/HPT/ABC/${String(max + 1).padStart(3,'0')}/${yr}`;
+}
+// Build cylinder rows from the Fire Extinguisher assets at a site
+function feRowsFromAssets(client, site){
+  const fes = state.assets.filter(a => lc(a.client) === lc(client) && lc(a.site) === lc(site) && a.assetType === 'Fire Extinguisher' && a.status !== 'Removed');
+  const rows = [];
+  fes.forEach(a => { const qty = assetQty(a); for(let i=0;i<qty;i++) rows.push({gas: a.feGas || 'ABC', weight: a.feWeight || '', tareWt:'', currentWt:'', lossWt:'', waterCap:'', actualWaterCap:'', testPressure:'35', testExpansion:'', exam:'OK', permExpansion:'', remarks:'Passed'}); });
+  return rows;
+}
+function renderCertificates(){
+  const list = scoped(state.certificates).slice().sort((a,b) => new Date(b.testDate||0) - new Date(a.testDate||0)).filter(matchQ);
+  const body = list.length ? `<div class="grid cols">${list.map(certCard).join('')}</div>`
+    : emptyBox('cert', state.q ? 'No matches' : 'No certificates yet', state.readOnly ? 'Your fire-extinguisher test certificates will appear here.' : 'Tap New certificate to create a hydrostatic test record.');
+  return listToolbar(null) + `<div id="listArea">${body}</div>`;
+}
+function certCard(c){
+  const n = (c.rows||[]).length;
+  const due = c.dueDate ? new Date(c.dueDate) : null;
+  const overdue = due && due < new Date();
+  const soon = due && !overdue && (due - new Date()) < 60*864e5;
+  return `<div class="card" onclick="openCert('${c.id}')">
+    <div class="row1">${avatar(c.client||'FE')}
+      <div class="body"><div class="title">${esc(c.client||'—')}${c.site ? ' · '+esc(c.site) : ''}</div><div class="meta">${esc(c.certNo||'No number')} · ${n} cylinder${n===1?'':'s'}</div></div>
+      <span class="badge ${overdue?'crit':soon?'warn':'ok'}"><span class="dot"></span>${overdue?'Expired':soon?'Due soon':'Valid'}</span></div>
+    <div class="foot"><span class="pill">Tested ${fmtDate(c.testDate)}</span><span class="pill ${overdue?'crit':soon?'warn':''}">Due ${fmtDate(c.dueDate)}</span></div>
+  </div>`;
+}
+function openCert(id){ state.certView = state.certificates.find(c => c.id === id) || null; render(); }
+function closeCert(){ state.certView = null; render(); }
+function duplicateCert(id){
+  const c = state.certificates.find(x => x.id === id); if(!c) return;
+  const copy = JSON.parse(JSON.stringify(c));
+  copy.id = cid(); copy.certNo = suggestCertNo();
+  const d = new Date(); const iso = x => x.toISOString().slice(0,10);
+  const due = new Date(d); due.setFullYear(due.getFullYear() + 1);
+  copy.testDate = iso(d); copy.dueDate = iso(due);
+  state.certView = null;
+  openModal('certForm', copy, true);
+}
+
 function reportCard(r){
   return `
     <div class="card" onclick="openReportPreview('${r.id}')">
@@ -1232,8 +1413,8 @@ function renderModal(){
       <div class="field"><label>Client</label><input name="client" list="clientList" value="${esc(data.client)}" autocomplete="off" oninput="onClientInput(this)" onchange="onClientInput(this)"><div class="client-hint"></div></div>
       <datalist id="clientList">${state.clients.map(c=>`<option value="${esc(c.name)}">`).join('')}</datalist>
       <div class="field"><label>Site</label><input name="site" list="siteListC" value="${esc(data.site)}" autocomplete="off"><datalist id="siteListC">${(data.client ? sitesOf(data.client) : allSites()).map(x=>`<option value="${esc(x)}">`).join('')}</datalist></div>
-      <div class="field"><label>System type</label>
-        <select name="systemType">${SYSTEM_TYPES.map(s=>`<option ${data.systemType===s?'selected':''}>${s}</option>`).join('')}</select>
+      <div class="field"><label>Systems covered <span style="font-weight:400; color:var(--dim)">(tick all that apply)</span></label>
+        <div class="checks">${SYSTEM_TYPES.map(s=>`<label class="check"><input type="checkbox" name="systemTypes" value="${esc(s)}" ${systemsOf(data).includes(s)?'checked':''}><span>${esc(s)}</span></label>`).join('')}</div>
       </div>
       <div class="field"><label>Visit frequency</label>
         <select name="visitFrequency">${Object.keys(FREQ).map(f=>`<option ${(data.visitFrequency||'Quarterly')===f?'selected':''}>${f}</option>`).join('')}</select>
@@ -1291,8 +1472,12 @@ function renderModal(){
         <div class="field"><label>Floor / area</label><input name="location" value="${esc(data.location)}" placeholder="e.g. 2nd floor server room"></div>
       </div>
       <div class="row2">
-        <div class="field"><label>Asset type</label><select name="assetType">${ASSET_TYPES.map(t=>`<option ${data.assetType===t?'selected':''}>${t}</option>`).join('')}</select></div>
+        <div class="field"><label>Asset type</label><select name="assetType" onchange="document.getElementById('feRow').hidden = this.value !== 'Fire Extinguisher'">${ASSET_TYPES.map(t=>`<option ${data.assetType===t?'selected':''}>${t}</option>`).join('')}</select></div>
         <div class="field"><label>Quantity</label><input type="number" min="1" name="qty" value="${esc(data.qty || 1)}"></div>
+      </div>
+      <div class="row2" id="feRow" ${data.assetType === 'Fire Extinguisher' ? '' : 'hidden'}>
+        <div class="field"><label>Extinguisher gas</label><input name="feGas" list="feGasList" value="${esc(data.feGas)}" placeholder="ABC, CO2, Water…"><datalist id="feGasList">${FE_GASES.map(g=>`<option value="${g}">`).join('')}</datalist></div>
+        <div class="field"><label>Cylinder weight</label><input name="feWeight" list="feWtList" value="${esc(data.feWeight)}" placeholder="2kg, 4.5kg…"><datalist id="feWtList">${FE_WEIGHTS.map(w=>`<option value="${w}">`).join('')}</datalist></div>
       </div>
       <div class="row2">
         <div class="field"><label>Make</label><input name="make" value="${esc(data.make)}"></div>
@@ -1381,6 +1566,29 @@ function renderModal(){
       </div>
       <div class="field"><label>Checked by (optional)</label><input name="checkedBy" value="${esc(data.checkedBy)}"></div>
     `;
+  } else if(type === 'certForm'){
+    title = isNew ? 'New FE Certificate' : 'Edit Certificate';
+    const clientObj = findClient(data.client);
+    fields = `
+      <div class="row2">
+        <div class="field"><label>Certificate no.</label><input name="certNo" value="${esc(data.certNo)}"></div>
+        <div class="field"><label>Client</label><input name="client" list="clientListCe" value="${esc(data.client)}" autocomplete="off" oninput="onClientInput(this)" onchange="onClientInput(this)"><datalist id="clientListCe">${state.clients.map(c=>`<option value="${esc(c.name)}">`).join('')}</datalist></div>
+      </div>
+      <div class="row2">
+        <div class="field"><label>Site / branch</label><input name="site" list="siteListCe" value="${esc(data.site)}" autocomplete="off"><datalist id="siteListCe">${(data.client ? sitesOf(data.client) : allSites()).map(x=>`<option value="${esc(x)}">`).join('')}</datalist></div>
+        <div class="field"><label>Party name (on certificate)</label><input name="party" value="${esc(data.party || (clientObj ? clientObj.name : data.client) || '')}"></div>
+      </div>
+      <div class="row2">
+        <div class="field"><label>Test date</label><input type="date" name="testDate" value="${data.testDate||''}" onchange="syncDueDate(this)"></div>
+        <div class="field"><label>Due date</label><input type="date" name="dueDate" value="${data.dueDate||''}"></div>
+      </div>
+      <div class="field"><label style="display:flex; align-items:center; justify-content:space-between"><span>Cylinders</span>
+        <span style="display:flex; gap:6px"><button type="button" class="mini-btn" onclick="prefillCylinders()">${ic('box')} From assets</button><button type="button" class="mini-btn go" onclick="addCylinder()">+ Row</button></span></label>
+        <div id="cylWrap">${cylinderRowsHTML(data.rows || [])}</div>
+        <div class="ai-note">Gas, weight and pressure print on the certificate. Fill the measured values after testing.</div>
+      </div>
+      <div class="field"><label>Tested by</label><input name="testedBy" value="${esc(data.testedBy || 'Conx Systems')}"></div>
+    `;
   }
 
   return `
@@ -1390,7 +1598,7 @@ function renderModal(){
         <div class="mhead"><h2>${title}</h2><button type="button" class="iconbtn" onclick="closeModal()" aria-label="Close" style="width:36px;height:36px;font-size:18px">✕</button></div>
         ${state.modal.error ? `<div class="modal-error">${esc(state.modal.error)}</div>` : ''}
         <form onsubmit="submitModal(event)">
-          ${fields}
+          <fieldset class="ro" ${state.readOnly ? 'disabled' : ''}>${fields}</fieldset>
           <div class="modal-actions">
             ${!isNew && !state.readOnly ? `<button type="button" class="btn btn-danger" onclick="deleteCurrent()">${state.modal.confirmDelete ? 'Tap again to delete' : 'Delete'}</button>` : ''}
             <button type="button" class="btn btn-ghost" onclick="closeModal()">Cancel</button>
@@ -1572,7 +1780,7 @@ function renderClientDetail(){
 
         <div class="dcol">
           <div class="panel"><div class="sec"><h2>${ic('key')} Access &amp; notes</h2>${ro ? '' : `<button class="mini-btn go" onclick="addNoteFor('${c.id}')">+ Note</button>`}</div>
-            <div class="s" style="margin-bottom:8px">Visible to everyone who signs in to Conx Ops.</div>
+            <div class="s" style="margin-bottom:8px">${state.role === 'client' ? 'Logins and network details for your systems.' : 'Visible to everyone who signs in to Conx Ops.'}</div>
             ${notes.length ? notes.map(noteRow).join('') : '<div class="s">No logins or notes yet.</div>'}</div>
 
           <div class="panel"><div class="sec"><h2>${ic('file')} Quarterly update</h2></div>
@@ -1588,6 +1796,144 @@ function renderClientDetail(){
       </div>
     </div></div>
   </div>`;
+}
+
+
+// ---------- FE certificate: cylinder row editor ----------
+const CYL_COLS = ['gas','weight','tareWt','currentWt','lossWt','waterCap','actualWaterCap','testPressure','testExpansion','exam','permExpansion','remarks'];
+function cylinderRowsHTML(rows){
+  if(!rows.length) return '<div class="s" id="cylEmpty" style="padding:6px 0">No cylinders yet. Tap “From assets” to pull the site’s fire extinguishers, or “+ Row”.</div>';
+  return rows.map((r,i) => cylRowHTML(r,i)).join('');
+}
+function cylRowHTML(r, i){
+  r = r || {};
+  const f = (name, ph, w) => `<input name="cyl_${name}" value="${esc(r[name]||'')}" placeholder="${ph}" style="width:${w}" autocomplete="off">`;
+  return `<div class="cylrow" data-i="${i}">
+    <span class="cyln">${i+1}</span>
+    <input name="cyl_gas" list="feGasList2" value="${esc(r.gas||'')}" placeholder="Gas" style="width:66px">
+    <input name="cyl_weight" list="feWtList2" value="${esc(r.weight||'')}" placeholder="Wt" style="width:60px">
+    ${f('tareWt','Tare','58px')}${f('currentWt','Current','62px')}${f('testPressure','Test P','56px')}
+    <input name="cyl_remarks" value="${esc(r.remarks||'Passed')}" placeholder="Remarks" style="width:84px">
+    <button type="button" class="iconbtn sm" onclick="this.closest('.cylrow').remove(); renumberCyl()" aria-label="Remove">✕</button>
+  </div>`;
+}
+function renumberCyl(){ [...document.querySelectorAll('#cylWrap .cylrow')].forEach((el,i) => el.querySelector('.cyln').textContent = i+1); }
+function addCylinder(pref){
+  const wrap = document.getElementById('cylWrap'); if(!wrap) return;
+  const e = document.getElementById('cylEmpty'); if(e) e.remove();
+  const i = wrap.querySelectorAll('.cylrow').length;
+  wrap.insertAdjacentHTML('beforeend', cylRowHTML(pref || {testPressure:'35', remarks:'Passed'}, i));
+  if(!document.getElementById('feGasList2')) wrap.insertAdjacentHTML('beforeend', `<datalist id="feGasList2">${FE_GASES.map(g=>`<option value="${g}">`).join('')}</datalist><datalist id="feWtList2">${FE_WEIGHTS.map(w=>`<option value="${w}">`).join('')}</datalist>`);
+}
+function prefillCylinders(){
+  const form = document.querySelector('.modal form'); if(!form) return;
+  const client = form.elements['client'].value, site = form.elements['site'].value;
+  if(!client || !site){ toast('Choose client and site first'); return; }
+  const rows = feRowsFromAssets(client, site);
+  if(!rows.length){ toast('No fire extinguishers found for that site. Add them under Assets.'); return; }
+  const wrap = document.getElementById('cylWrap'); wrap.innerHTML = '';
+  rows.forEach(r => addCylinder(r));
+  toast(rows.length + ' cylinder' + (rows.length===1?'':'s') + ' added from assets');
+}
+function gatherCylinders(form){
+  const rows = [];
+  form.querySelectorAll('#cylWrap .cylrow').forEach(el => {
+    const r = {};
+    CYL_COLS.forEach(c => { const inp = el.querySelector(`[name="cyl_${c}"]`); if(inp) r[c] = inp.value.trim(); });
+    r.lossWt = (parseFloat(r.tareWt) && parseFloat(r.currentWt)) ? (Math.round((parseFloat(r.tareWt) - parseFloat(r.currentWt))*1000)/1000).toString() : (r.lossWt||'');
+    if(Object.values(r).some(v => v)) rows.push(r);
+  });
+  return rows;
+}
+function syncDueDate(el){
+  const form = el.form; const due = form.elements['dueDate'];
+  if(due && (!due.value || due.dataset.auto === due.value)){ const d = new Date(el.value); if(!isNaN(d)){ d.setFullYear(d.getFullYear()+1); due.value = d.toISOString().slice(0,10); due.dataset.auto = due.value; } }
+}
+
+// ---------- FE certificate: A4 document ----------
+function certTableHTML(c){
+  const B = 'border:1px solid #000;', P = 'padding:5px 6px; font-size:11px;';
+  const rows = (c.rows||[]);
+  const body = rows.map((r,i) => `<tr>
+    <td style="${B}${P} text-align:center">${i+1}</td>
+    <td style="${B}${P}">${esc(r.gas)}</td><td style="${B}${P}">${esc(r.weight)}</td>
+    <td style="${B}${P} text-align:right">${esc(r.tareWt)}</td><td style="${B}${P} text-align:right">${esc(r.currentWt)}</td>
+    <td style="${B}${P} text-align:right">${esc(r.lossWt)}</td><td style="${B}${P} text-align:right">${esc(r.waterCap)}</td>
+    <td style="${B}${P} text-align:right">${esc(r.actualWaterCap)}</td><td style="${B}${P} text-align:center">${esc(r.testPressure)}</td>
+    <td style="${B}${P} text-align:right">${esc(r.testExpansion)}</td><td style="${B}${P} text-align:center">${esc(r.exam||'OK')}</td>
+    <td style="${B}${P} text-align:right">${esc(r.permExpansion)}</td><td style="${B}${P} text-align:center">${esc(r.remarks||'Passed')}</td></tr>`).join('')
+    || `<tr><td colspan="13" style="${B}${P} color:#888; text-align:center">No cylinders added</td></tr>`;
+  return `
+  <div style="font-family:Calibri,Arial,sans-serif; color:#111;">
+    <table style="width:100%; border-collapse:collapse; ${B} margin-bottom:10px"><tr>
+      <td style="${B} width:22%; text-align:center; vertical-align:middle; padding:6px"><img src="${CX_ICON_URI}" style="height:30px"><br><img src="${LOGO_DATA_URI}" style="height:20px; margin-top:4px"></td>
+      <td style="${B} text-align:center; padding:6px">
+        <div style="font-size:16px; font-weight:800; letter-spacing:.5px">HYDROSTATIC TEST CERTIFICATE</div>
+        <div style="font-size:10px; margin-top:3px">RECORD FOR EXAMINATION AND HYDROSTATIC PRESSURE TESTING OF CYLINDERS</div>
+        <div style="font-size:9px; color:#444; margin-top:4px">${esc(COMPANY_ADDRESS)}</div>
+      </td></tr></table>
+    <table style="width:100%; border-collapse:collapse; ${B} margin-bottom:8px">
+      <tr><td style="${B}${P}"><b>CERTIFICATE NO:</b> ${esc(c.certNo)}</td><td style="${B}${P}"><b>TEST DATE:</b> ${fmtDate(c.testDate)}</td><td style="${B}${P}"><b>DUE DATE:</b> ${fmtDate(c.dueDate)}</td></tr>
+      <tr><td style="${B}${P}" colspan="2"><b>PARTY NAME:</b> ${esc(c.party || c.client)}</td><td style="${B}${P}"><b>SITE:</b> ${esc(c.site)}</td></tr>
+    </table>
+    <table style="width:100%; border-collapse:collapse; ${B} table-layout:fixed">
+      <tr style="background:#eee">
+        ${['Sr','Gas','Wt','Tare WT','Current WT','Loss WT','Water Cap','Act. Water','Test Press','Test Exp','Exam','% Perm Exp','Remarks'].map(h=>`<td style="${B}${P} font-weight:700; text-align:center; font-size:9.5px">${h}</td>`).join('')}
+      </tr>
+      ${body}
+    </table>
+    <table style="width:100%; border-collapse:collapse; ${B} margin-top:14px">
+      <tr><td style="${B}${P} height:48px; vertical-align:bottom"><b>Tested by:</b> ${esc(c.testedBy||'Conx Systems')}</td>
+      <td style="${B}${P} vertical-align:bottom; text-align:right"><b>Signature &amp; Seal</b></td></tr>
+    </table>
+    <div style="font-size:8.5px; color:#555; margin-top:6px">This certificate is issued on the basis of hydrostatic testing carried out as per IS 2190 / relevant standards.</div>
+  </div>`;
+}
+function renderCertPreview(){
+  const c = state.certView;
+  return `
+    <div class="report-overlay">
+      <div class="report-toolbar">
+        <button class="close-btn" onclick="closeCert()">&#8592;</button>
+        <div class="spacer"></div>
+        ${state.readOnly ? '' : `<button class="act" onclick="openModal('certForm', ${escAttr(c)}, false)">Edit</button>
+        <button class="act" onclick="duplicateCert('${c.id}')">Duplicate</button>
+        <button class="act" onclick="deleteCert('${c.id}')">${state.confirmCertDelete ? 'Tap again' : 'Delete'}</button>`}
+        <button class="act" onclick="printReport()">Print</button>
+        <button class="act primary" id="pdfBtn" onclick="downloadCertPDF()">Download PDF</button>
+      </div>
+      <div class="report-scroll">
+        <div class="sheet-wrap" id="sheetWrap"><div class="report-doc" id="certDocEl">${certTableHTML(c)}</div></div>
+      </div>
+    </div>`;
+}
+async function deleteCert(id){
+  if(!state.confirmCertDelete){ state.confirmCertDelete = true; render(); return; }
+  try{ await removeRecord('certificates', id); }catch(e){ toast(writeError(e)); }
+  state.confirmCertDelete = false; state.certView = null; render();
+}
+async function downloadCertPDF(){
+  const c = state.certView; if(!c) return;
+  const btn = document.getElementById('pdfBtn'); const label = btn ? btn.textContent : '';
+  if(btn){ btn.disabled = true; btn.textContent = 'Making PDF…'; }
+  let host = null;
+  try{
+    await ensurePdfLibs();
+    host = document.createElement('div');
+    host.style.cssText = 'position:absolute; left:-10000px; top:0; width:794px; min-height:1123px; box-sizing:border-box; padding:40px; background:#fff;';
+    host.innerHTML = certTableHTML(c);
+    document.body.appendChild(host);
+    await new Promise(r => setTimeout(r, 120));
+    const canvas = await window.html2canvas(host, {scale: 3, backgroundColor: '#ffffff', useCORS: true, logging: false});
+    const pdf = new window.jspdf.jsPDF({unit: 'mm', format: 'a4', compress: true});
+    const pageW = 210, pageH = 297, imgH = canvas.height * pageW / canvas.width;
+    const img = canvas.toDataURL('image/png');
+    const pages = Math.max(1, Math.ceil(imgH / pageH - 0.001));
+    for(let i = 0; i < pages; i++){ if(i>0) pdf.addPage(); pdf.addImage(img, 'PNG', 0, -i*pageH, pageW, imgH); }
+    const safe = (c.certNo || 'certificate').replace(/[^a-z0-9]+/gi,'_').replace(/^_|_$/g,'');
+    await saveFile(`FE-Cert-${safe}.pdf`, pdf.output('blob'), 'application/pdf');
+  }catch(e){ toast('Could not make the PDF. Check your connection and try again.'); }
+  finally{ if(host) host.remove(); if(btn){ btn.disabled = false; btn.textContent = label; } }
 }
 
 function renderReportPreview(){
@@ -1617,9 +1963,9 @@ function fillPage(root){
   f.style.height = Math.max(0, A4_INNER_H - t.offsetHeight) + 'px';
 }
 function fitSheet(){
-  fillPage(document.getElementById('reportDocEl'));
+  const doc = document.getElementById('reportDocEl') || document.getElementById('certDocEl');
+  if(document.getElementById('reportDocEl')) fillPage(doc);
   const wrap = document.getElementById('sheetWrap');
-  const doc = document.getElementById('reportDocEl');
   const scroller = wrap && wrap.parentElement;
   if(!wrap || !doc || !scroller) return;
   const cs = getComputedStyle(scroller);
@@ -1629,7 +1975,7 @@ function fitSheet(){
   wrap.style.width = Math.round(794 * k) + 'px';
   wrap.style.height = Math.round(doc.offsetHeight * k) + 'px';
 }
-window.addEventListener('resize', () => { if(state.reportView) fitSheet(); });
+window.addEventListener('resize', () => { if(state.reportView || state.certView) fitSheet(); });
 
 function printReport(){
   // Opens the device's print sheet: AirPrint on iPad/iPhone, the system print dialog on a computer.
@@ -1910,13 +2256,64 @@ async function saveFile(filename, data, mime){
   return true;
 }
 
-function openData(){ state.dataOpen = true; state.dataMsg = null; state.importPending = null; render(); }
+function openData(){ state.dataOpen = true; state.dataMsg = null; state.importPending = null; render(); if(state.role==='staff') loadAccessList(); }
+async function loadAccessList(){
+  try{ const {data, error} = await SB.rpc('list_access'); if(error) throw error;
+    state.access.list = (data||[]).map(r => ({email:r.email, role:r.role, client:r.client_name, sites: Array.isArray(r.sites)?r.sites:(r.sites?JSON.parse(r.sites):[])}));
+    state.access.loaded = true; softRender();
+  }catch(e){ state.access.loaded = true; state.access.list = []; state.access.err = (/42883|PGRST202|does not exist|function/i.test(JSON.stringify(e))) ? 'notset' : 'err'; softRender(); }
+}
+function accPickCompany(v){ state.access.company = v; state.access.sites = []; render(); }
+function accToggleSite(site){ const i = state.access.sites.indexOf(site); if(i<0) state.access.sites.push(site); else state.access.sites.splice(i,1); render(); }
+function accSetEmail(v){ state.access.email = v; }
+async function accSave(role){
+  const a = state.access; const email = (document.getElementById('accEmail')||{}).value || a.email;
+  if(!email || !/@/.test(email)){ a.msg = {kind:'err', text:'Enter the login email first.'}; render(); return; }
+  if(role==='client' && !a.company){ a.msg = {kind:'err', text:'Pick the company.'}; render(); return; }
+  a.busy = true; a.msg = {kind:'ok', text:'Saving…'}; render();
+  try{
+    const call = role==='client'
+      ? SB.rpc('set_portal', {p_email: email, p_client: a.company, p_sites: a.sites})
+      : SB.rpc('set_staff', {p_email: email});
+    const {data, error} = await call; if(error) throw error;
+    if(data === 'NOUSER'){ a.busy=false; a.msg={kind:'err', text:'No login with that email yet. In Supabase > Authentication > Users, add the user first, then come back.'}; render(); return; }
+    a.msg = {kind:'ok', text: role==='client' ? (email+' can now view '+a.company+(a.sites.length?' ('+a.sites.join(', ')+')':' (all branches)')) : (email+' is now staff.')};
+    a.email=''; a.sites=[]; a.busy=false; await loadAccessList();
+  }catch(e){ a.busy=false; a.msg={kind:'err', text: /not allowed/i.test(JSON.stringify(e)) ? 'Only staff can change access.' : 'Could not save. Run supabase/client-access.sql once, then try again.'}; render(); }
+}
+async function accRevoke(email){
+  state.access.busy = true; render();
+  try{ const {data, error} = await SB.rpc('revoke_access', {p_email: email}); if(error) throw error; state.access.msg = {kind:'ok', text: email+' now has no access.'}; }
+  catch(e){ state.access.msg = {kind:'err', text:'Could not remove access.'}; }
+  state.access.busy = false; await loadAccessList();
+}
+function accessBlockHTML(){
+  const a = state.access;
+  if(a.err === 'notset') return `<div class="data-sub">Run <code>supabase/client-access.sql</code> once in the Supabase SQL Editor to turn on client logins.</div>`;
+  const companies = state.clients.map(c => c.name).sort((x,y)=>x.localeCompare(y));
+  const branches = a.company ? sitesOf(a.company) : [];
+  const clientRows = a.list.filter(r => r.role==='client');
+  return `
+    <div class="data-sub">Give a client a view-only login for their company. First add the user in Supabase &gt; Authentication &gt; Users, then assign here.</div>
+    <input id="accEmail" type="email" placeholder="client@email.com" value="${esc(a.email)}" oninput="accSetEmail(this.value)" autocomplete="off" style="width:100%; box-sizing:border-box; margin:10px 0; background:var(--surface-2); border:1px solid var(--line,rgba(255,255,255,.14)); border-radius:10px; padding:11px 12px; color:inherit">
+    <label style="font-size:12px; color:var(--dim)">Company</label>
+    <select onchange="accPickCompany(this.value)" style="width:100%; box-sizing:border-box; margin:6px 0 4px; background:var(--surface-2); border:1px solid var(--line,rgba(255,255,255,.14)); border-radius:10px; padding:11px 12px; color:inherit">
+      <option value="">Choose company…</option>${companies.map(c=>`<option ${a.company===c?'selected':''}>${esc(c)}</option>`).join('')}</select>
+    ${a.company ? `<div class="data-sub" style="margin-top:8px">Branches this login can see ${a.sites.length?'':'(none ticked = all branches)'}:</div>
+      <div class="branchpick">${branches.length ? branches.map(b=>`<label class="check"><input type="checkbox" ${a.sites.includes(b)?'checked':''} onchange="accToggleSite('${esc(b)}')"><span>${esc(b)}</span></label>`).join('') : '<div class="s">No branches recorded for this company yet. The login will see all of the company\'s data.</div>'}</div>` : ''}
+    <div class="data-row" style="margin-top:6px">
+      <button class="btn btn-primary" onclick="accSave('client')" ${a.busy?'disabled':''}>Give client access</button>
+      <button class="btn btn-ghost" onclick="accSave('staff')" ${a.busy?'disabled':''}>Make staff</button>
+    </div>
+    ${clientRows.length ? `<div class="data-sub" style="margin-top:14px">Client logins:</div>${clientRows.map(r=>`<div class="acc-row"><div class="grow"><div><b>${esc(r.email)}</b></div><div class="s">${esc(r.client||'')}${r.sites&&r.sites.length?' · '+r.sites.map(esc).join(', '):' · all branches'}</div></div><button class="mini-btn" onclick="accRevoke('${esc(r.email)}')">Remove</button></div>`).join('')}` : '<div class="s" style="margin-top:12px">No client logins yet.</div>'}
+    ${a.msg ? `<div class="data-msg ${a.msg.kind}" style="margin-top:10px">${esc(a.msg.text)}</div>` : ''}`;
+}
 function closeData(){ state.dataOpen = false; state.dataMsg = null; state.importPending = null; render(); }
 
 async function exportBackup(){
   const payload = {
     app: 'conx-ops', version: 1, exportedAt: new Date().toISOString(),
-    contracts: state.contracts, clients: state.clients, tickets: state.tickets, reports: state.reports, assets: state.assets, notes: state.notes
+    contracts: state.contracts, clients: state.clients, tickets: state.tickets, reports: state.reports, assets: state.assets, notes: state.notes, certificates: state.certificates
   };
   const ok = await saveFile(`conx-ops-backup-${stamp()}.json`, JSON.stringify(payload, null, 2), 'application/json');
   if(ok){ state.dataMsg = {kind:'ok', text:'Backup saved. Keep a copy somewhere safe, such as iCloud Drive.'}; render(); }
@@ -1946,7 +2343,7 @@ function handleImportFile(e){
       const d = JSON.parse(reader.result);
       if(!d || d.app !== 'conx-ops') throw new Error('notbackup');
       const pick = k => Array.isArray(d[k]) ? d[k] : [];
-      state.importPending = {exportedAt: d.exportedAt, contracts: pick('contracts'), clients: pick('clients'), tickets: pick('tickets'), reports: pick('reports'), assets: pick('assets'), notes: pick('notes')};
+      state.importPending = {exportedAt: d.exportedAt, contracts: pick('contracts'), clients: pick('clients'), tickets: pick('tickets'), reports: pick('reports'), assets: pick('assets'), notes: pick('notes'), certificates: pick('certificates')};
       state.dataMsg = null;
     }catch(err){
       state.importPending = null;
@@ -1980,7 +2377,7 @@ async function applyImport(mode){
   state.saving = true;
   state.dataMsg = {kind:'ok', text:'Importing…'};
   render();
-  const norm = list => list.filter(x => x && typeof x === 'object').map(x => ({...x, id: String(x.id || cid())}));
+  const norm = list => (list||[]).filter(x => x && typeof x === 'object').map(x => ({...x, id: String(x.id || cid())}));
   const jobs = [];
   let failed = 0, total = 0;
   for(const kind of KINDS){
@@ -2009,7 +2406,7 @@ function renderDataModal(){
   const p = state.importPending;
   const counts = `${state.contracts.length} contracts · ${state.clients.length} clients · ${state.assets.length} assets · ${state.notes.length} notes · ${state.tickets.length} tickets · ${state.reports.length} reports`;
   const importBlock = p ? `
-      <div class="data-sub">Backup${p.exportedAt ? ' from ' + esc(fmtDate(p.exportedAt)) : ''}: ${p.contracts.length} contracts · ${p.clients.length} clients · ${p.assets.length} assets · ${p.notes.length} notes · ${p.tickets.length} tickets · ${p.reports.length} reports</div>
+      <div class="data-sub">Backup${p.exportedAt ? ' from ' + esc(fmtDate(p.exportedAt)) : ''}: ${p.contracts.length} contracts · ${p.clients.length} clients · ${p.assets.length} assets · ${p.notes.length} notes · ${(p.certificates||[]).length} certificates · ${p.tickets.length} tickets · ${p.reports.length} reports</div>
       <div class="data-row">
         <button class="btn btn-primary" onclick="applyImport('merge')">Merge</button>
         <button class="btn btn-danger" onclick="applyImport('replace')">${p.armed ? 'Tap again to replace everything' : 'Replace all'}</button>
@@ -2052,6 +2449,10 @@ function renderDataModal(){
             <button class="btn btn-primary" onclick="saveBackupEmail()">Save email</button>
             <button class="btn btn-ghost" onclick="sendBackupNow()" ${state.backupBusy ? 'disabled' : ''}>Send a backup now</button>
           </div>
+        </div>
+        <div class="data-block">
+          <div class="data-title">${ic('key')} Client logins &amp; access</div>
+          ${accessBlockHTML()}
         </div>
         <div class="data-block">
           <div class="data-title">Import backup</div>
